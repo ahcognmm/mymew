@@ -18,7 +18,6 @@ const ToolCall = message.ToolCall;
 /// is a valid provider. `chat` returns the assistant's reply as a `Message`
 /// (with `.content` and/or `.tool_calls` populated). No vtable: the engine
 /// is generic over the provider type and calls this method directly.
-
 /// Writes a pre-serialized JSON blob verbatim as a field's value, so
 /// comptime-generated tool schemas can be spliced into a request without
 /// being treated as opaque strings.
@@ -152,16 +151,16 @@ fn toAgentMessage(gpa: std.mem.Allocator, resp: RespMessage) !Message {
         var list: std.ArrayList(ToolCall) = .empty;
         for (tcs) |tc| {
             try list.append(gpa, .{
-                .id = tc.id,
-                .name = tc.function.name,
-                .arguments_json = tc.function.arguments,
+                .id = try gpa.dupe(u8, tc.id),
+                .name = try gpa.dupe(u8, tc.function.name),
+                .arguments_json = try gpa.dupe(u8, tc.function.arguments),
             });
         }
         calls = list.items;
     }
     return .{
         .role = .assistant,
-        .content = resp.content orelse "",
+        .content = if (resp.content) |c| try gpa.dupe(u8, c) else "",
         .tool_calls = calls,
     };
 }
@@ -178,8 +177,8 @@ pub const ChatError = error{
 /// `/chat/completions` endpoint: https://docs.z.ai.
 pub const Glm = struct {
     api_key: []const u8,
-    model: []const u8 = "glm-4.6",
-    base_url: []const u8 = "https://api.z.ai/api/paas/v4/chat/completions",
+    model: []const u8 = "glm-5.2",
+    base_url: []const u8 = "https://api.z.ai/api/coding/paas/v4/chat/completions",
 
     pub fn fromEnv(env: *const std.process.Environ.Map) !Glm {
         const api_key = env.get("GLM_API_KEY") orelse env.get("ZAI_API_KEY") orelse
