@@ -71,8 +71,11 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
         /// given) to memory, then repeatedly calls the provider and executes
         /// any requested tools until the LLM returns a final answer, or the
         /// self-healing circuit breaker trips.
-        pub fn step(self: *Self, user_text: ?[]const u8) !Outcome {
-            if (user_text) |t| try self.mem.append(Message.user(t));
+        ///
+        /// `writer`, if non-null, receives streaming content tokens from the
+        /// provider and tool-dispatch progress lines as they happen.
+        pub fn step(self: *Self, user_text: ?[]const u8, writer: ?*Io.Writer) !Outcome {
+            if (user_text) |t| try self.mem.append(Message.user(try self.gpa.dupe(u8, t)));
 
             // Known-good boundary: if we have to escalate, everything from
             // here onward (this turn's malformed attempts) gets pruned.
@@ -80,10 +83,14 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
             var retries: usize = 0;
 
             while (true) {
-                const reply = try self.provider.chat(self.gpa, self.io, self.mem.items(), &descriptors);
+                const reply = try self.provider.chat(self.gpa, self.io, self.mem.items(), &descriptors, writer);
 
                 if (reply.tool_calls.len == 0) {
                     try self.mem.append(reply);
+                    if (writer) |w| {
+                        try w.writeAll("\n");
+                        try w.flush();
+                    }
                     return .{ .final = reply.content };
                 }
 
@@ -91,14 +98,25 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
 
                 var last_failure: ?tool.InvokeResult = null;
                 for (reply.tool_calls) |tc| {
+                    if (writer) |w| {
+                        try w.print("\n[-> {s}]\n", .{tc.name});
+                        try w.flush();
+                    }
                     const result = self.dispatch(tc.name, tc.arguments_json);
                     switch (result) {
-                        .ok => |s| try self.mem.append(.{
-                            .role = .tool,
-                            .tool_call_id = tc.id,
-                            .name = tc.name,
-                            .content = s,
-                        }),
+                        .ok => |s| {
+                            if (writer) |w| {
+                                const display = if (s.len > 120) s[0..120] else s;
+                                try w.print("[<- {s}]\n", .{display});
+                                try w.flush();
+                            }
+                            try self.mem.append(.{
+                                .role = .tool,
+                                .tool_call_id = tc.id,
+                                .name = tc.name,
+                                .content = s,
+                            });
+                        },
                         .invalid_args => |e| {
                             last_failure = result;
                             const diag = try std.fmt.allocPrint(
@@ -106,6 +124,10 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
                                 "Malformed arguments for tool \"{s}\": {s}\nRaw arguments: {s}\nFix the JSON and call the tool again.",
                                 .{ e.tool_name, e.diagnostic, e.raw_args_json },
                             );
+                            if (writer) |w| {
+                                try w.print("[error: {s}]\n", .{e.diagnostic});
+                                try w.flush();
+                            }
                             try self.mem.append(.{
                                 .role = .tool,
                                 .tool_call_id = tc.id,
@@ -119,6 +141,10 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
                 if (last_failure) |f| {
                     retries += 1;
                     if (retries > max_retries) {
+                        if (writer) |w| {
+                            try w.print("[escalating after {d} retries]\n", .{max_retries});
+                            try w.flush();
+                        }
                         return try self.escalate(turn_start, f.invalid_args);
                     }
                 }
@@ -175,7 +201,7 @@ test "step: happy path executes a tool then returns the final answer" {
     defer mem.deinit();
 
     var eng = Engine(TestTools, llm.Mock).init(testing.allocator, io, &mock, &mem);
-    const outcome = try eng.step("what is 2 + 3?");
+    const outcome = try eng.step("what is 2 + 3?", null);
 
     try testing.expect(outcome == .final);
     try testing.expectEqualStrings("The answer is 5.", outcome.final);
@@ -205,7 +231,7 @@ test "step: escalates and prunes context after max_retries malformed tool calls"
     defer mem.deinit();
 
     var eng = Engine(TestTools, llm.Mock).init(testing.allocator, io, &mock, &mem);
-    const outcome = try eng.step("compute something that will keep failing");
+    const outcome = try eng.step("compute something that will keep failing", null);
 
     try testing.expect(outcome == .escalated);
     try testing.expectEqual(@as(usize, 2), mem.items().len);

@@ -5,22 +5,13 @@ const tool = @import("tool.zig");
 const Message = message.Message;
 const ToolCall = message.ToolCall;
 
-/// The LLM Provider Comptime Contract: any struct exposing
+/// Provider contract: any struct with
 ///
-///     pub fn chat(
-///         self: *Self,
-///         gpa: std.mem.Allocator,
-///         io: std.Io,
-///         messages: []const Message,
-///         tools: []const tool.Descriptor,
-///     ) anyerror!Message
+///     pub fn chat(self: *Self, gpa, io, messages, tools, token_writer: ?*std.Io.Writer) anyerror!Message
 ///
-/// is a valid provider. `chat` returns the assistant's reply as a `Message`
-/// (with `.content` and/or `.tool_calls` populated). No vtable: the engine
-/// is generic over the provider type and calls this method directly.
-/// Writes a pre-serialized JSON blob verbatim as a field's value, so
-/// comptime-generated tool schemas can be spliced into a request without
-/// being treated as opaque strings.
+/// No vtable — Engine is generic over Provider and calls this directly.
+/// `token_writer`, if non-null, receives content tokens as they stream in.
+
 const RawJson = struct {
     bytes: []const u8,
 
@@ -65,35 +56,56 @@ const WireRequest = struct {
     model: []const u8,
     messages: []const WireMessage,
     tools: ?[]const WireTool = null,
+    stream: bool = true,
 };
 
+// SSE delta types — OpenAI-compatible streaming format
+const SseFunctionDelta = struct {
+    name: ?[]const u8 = null,
+    arguments: ?[]const u8 = null,
+};
+const SseToolCallDelta = struct {
+    index: u32 = 0,
+    id: ?[]const u8 = null,
+    function: ?SseFunctionDelta = null,
+};
+const SseDelta = struct {
+    role: ?[]const u8 = null,
+    content: ?[]const u8 = null,
+    reasoning_content: ?[]const u8 = null,
+    tool_calls: ?[]const SseToolCallDelta = null,
+};
+const SseChoice = struct {
+    delta: SseDelta = .{},
+    finish_reason: ?[]const u8 = null,
+};
+const SseChunk = struct {
+    choices: []const SseChoice = &.{},
+};
+
+// Non-streaming response types (used for error bodies)
 const RespFunctionCall = struct {
     name: []const u8,
     arguments: []const u8,
 };
-
 const RespToolCall = struct {
     id: []const u8,
     type: []const u8 = "function",
     function: RespFunctionCall,
 };
-
 const RespMessage = struct {
     role: []const u8 = "assistant",
     content: ?[]const u8 = null,
     tool_calls: ?[]const RespToolCall = null,
 };
-
 const RespChoice = struct {
     message: RespMessage,
     finish_reason: ?[]const u8 = null,
 };
-
 const RespError = struct {
     message: []const u8 = "",
     code: ?[]const u8 = null,
 };
-
 const RespBody = struct {
     choices: []const RespChoice = &.{},
     @"error": ?RespError = null,
@@ -122,12 +134,18 @@ fn buildWireMessages(scratch: std.mem.Allocator, messages: []const Message) ![]c
             }
             wire_calls = calls.items;
         }
+        // Never send empty-string content; GLM rejects it.
+        // Tool-call assistant messages have no content — omit the field entirely.
+        const wire_content: ?[]const u8 = if (m.content.len == 0 or m.tool_calls.len != 0)
+            null
+        else
+            m.content;
         try out.append(scratch, .{
             .role = roleName(m.role),
-            .content = if (m.content.len != 0 or m.tool_calls.len == 0) m.content else null,
+            .content = wire_content,
             .tool_calls = wire_calls,
-            .tool_call_id = if (m.role == .tool) m.tool_call_id else null,
-            .name = if (m.role == .tool) m.name else null,
+            .tool_call_id = if (m.role == .tool and m.tool_call_id.len > 0) m.tool_call_id else null,
+            .name = if (m.role == .tool and m.name.len > 0) m.name else null,
         });
     }
     return out.items;
@@ -145,36 +163,19 @@ fn buildWireTools(scratch: std.mem.Allocator, tools: []const tool.Descriptor) ![
     return out.items;
 }
 
-fn toAgentMessage(gpa: std.mem.Allocator, resp: RespMessage) !Message {
-    var calls: []const ToolCall = &.{};
-    if (resp.tool_calls) |tcs| {
-        var list: std.ArrayList(ToolCall) = .empty;
-        for (tcs) |tc| {
-            try list.append(gpa, .{
-                .id = try gpa.dupe(u8, tc.id),
-                .name = try gpa.dupe(u8, tc.function.name),
-                .arguments_json = try gpa.dupe(u8, tc.function.arguments),
-            });
-        }
-        calls = list.items;
-    }
-    return .{
-        .role = .assistant,
-        .content = if (resp.content) |c| try gpa.dupe(u8, c) else "",
-        .tool_calls = calls,
-    };
-}
-
-/// Errors returned by a chat-completion HTTP call to an OpenAI-compatible
-/// endpoint (used by `Glm` and any similar provider).
 pub const ChatError = error{
     MissingApiKey,
     ApiError,
     UnexpectedStatus,
 } || std.mem.Allocator.Error || std.Uri.ParseError;
 
-/// GLM (Zhipu / z.ai) provider. Talks to an OpenAI-compatible
-/// `/chat/completions` endpoint: https://docs.z.ai.
+/// Accumulates one tool call's streaming fragments.
+const ToolCallAccum = struct {
+    id: std.ArrayList(u8),
+    name: std.ArrayList(u8),
+    arguments: std.ArrayList(u8),
+};
+
 pub const Glm = struct {
     api_key: []const u8,
     model: []const u8 = "glm-5.2",
@@ -195,6 +196,7 @@ pub const Glm = struct {
         io: Io,
         messages: []const Message,
         tools: []const tool.Descriptor,
+        token_writer: ?*std.Io.Writer,
     ) anyerror!Message {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
@@ -202,51 +204,164 @@ pub const Glm = struct {
 
         const wire_messages = try buildWireMessages(scratch, messages);
         const wire_tools = if (tools.len != 0) try buildWireTools(scratch, tools) else null;
-        const req: WireRequest = .{ .model = self.model, .messages = wire_messages, .tools = wire_tools };
-        const body = try std.json.Stringify.valueAlloc(scratch, req, .{});
+        const body = try std.json.Stringify.valueAlloc(scratch, WireRequest{
+            .model = self.model,
+            .messages = wire_messages,
+            .tools = wire_tools,
+        }, .{ .emit_null_optional_fields = false });
+
+        const auth_header = try std.fmt.allocPrint(scratch, "Bearer {s}", .{self.api_key});
+        const uri = try std.Uri.parse(self.base_url);
 
         var client: std.http.Client = .{ .allocator = scratch, .io = io };
         defer client.deinit();
 
-        const auth_header = try std.fmt.allocPrint(scratch, "Bearer {s}", .{self.api_key});
-
-        var response_buf: std.Io.Writer.Allocating = .init(scratch);
-        defer response_buf.deinit();
-
-        const result = try client.fetch(.{
-            .location = .{ .url = self.base_url },
-            .method = .POST,
-            .payload = body,
-            .response_writer = &response_buf.writer,
+        var http_req = try client.request(.POST, uri, .{
             .headers = .{
                 .authorization = .{ .override = auth_header },
                 .content_type = .{ .override = "application/json" },
+                // Force plain-text response — gzip-encoded SSE would arrive as
+                // binary and break our line-by-line parser silently.
+                .accept_encoding = .{ .override = "identity" },
             },
         });
+        defer http_req.deinit();
 
-        const response_bytes = response_buf.written();
-        if (result.status != .ok) {
-            std.log.err("GLM API returned {d}: {s}", .{ @intFromEnum(result.status), response_bytes });
+        try http_req.sendBodyComplete(body);
+
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try http_req.receiveHead(&redirect_buf);
+        const status = response.head.status;
+
+        var transfer_buf: [16 * 1024]u8 = undefined;
+        const body_reader = response.reader(&transfer_buf);
+
+        if (status != .ok) {
+            // Drain error body for logging.
+            var err_buf: std.ArrayList(u8) = .empty;
+            drain: while (true) {
+                const chunk = body_reader.takeDelimiter('\n') catch break :drain;
+                const line = chunk orelse break :drain;
+                try err_buf.appendSlice(scratch, line);
+            }
+            std.log.err("GLM API returned {d}: {s}", .{ @intFromEnum(status), err_buf.items });
             return error.UnexpectedStatus;
         }
 
-        var parsed = try std.json.parseFromSlice(RespBody, scratch, response_bytes, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
+        // SSE accumulation
+        var content_buf: std.ArrayList(u8) = .empty;
+        var reasoning_buf: std.ArrayList(u8) = .empty;
+        var tc_accum: std.ArrayList(ToolCallAccum) = .empty;
+        var in_thinking = false;
 
-        if (parsed.value.@"error") |e| {
-            std.log.err("GLM API error: {s}", .{e.message});
-            return error.ApiError;
+        sse_loop: while (true) {
+            const maybe_line = body_reader.takeDelimiter('\n') catch |err| switch (err) {
+                error.StreamTooLong => continue :sse_loop, // oversized line, skip
+                error.ReadFailed => return error.ReadFailed,
+            };
+            const raw_line = maybe_line orelse break :sse_loop;
+            const line = std.mem.trimEnd(u8, raw_line, "\r");
+
+            if (!std.mem.startsWith(u8, line, "data: ")) continue;
+            const data = line["data: ".len..];
+            if (std.mem.eql(u8, data, "[DONE]")) break;
+
+            const chunk = std.json.parseFromSliceLeaky(SseChunk, scratch, data, .{
+                .ignore_unknown_fields = true,
+            }) catch |err| {
+                std.log.debug("SSE parse error: {s} | raw: {s}", .{ @errorName(err), data[0..@min(data.len, 80)] });
+                continue;
+            };
+            if (chunk.choices.len == 0) continue;
+
+            const delta = chunk.choices[0].delta;
+            std.log.debug("SSE delta: content={?s} reasoning={?s} tool_calls={}", .{
+                delta.content,
+                delta.reasoning_content,
+                delta.tool_calls != null,
+            });
+
+            // Reasoning/thinking content (GLM chain-of-thought)
+            if (delta.reasoning_content) |rc| {
+                if (rc.len > 0) {
+                    if (!in_thinking) {
+                        if (token_writer) |w| {
+                            try w.writeAll("\x1b[2;3m"); // dim + italic for thinking
+                            try w.flush(); // flush style change immediately
+                        }
+                        in_thinking = true;
+                    }
+                    try reasoning_buf.appendSlice(scratch, rc);
+                    if (token_writer) |w| try w.writeAll(rc);
+                }
+            }
+
+            // Regular content tokens
+            if (delta.content) |c| {
+                if (c.len > 0) {
+                    if (in_thinking) {
+                        if (token_writer) |w| {
+                            try w.writeAll("\x1b[0m\n"); // reset style, separator newline
+                            try w.flush(); // flush style change immediately
+                        }
+                        in_thinking = false;
+                    }
+                    try content_buf.appendSlice(scratch, c);
+                    if (token_writer) |w| try w.writeAll(c);
+                }
+            }
+
+            // Tool call fragments — accumulate by index
+            if (delta.tool_calls) |tcs| {
+                for (tcs) |tc| {
+                    while (tc_accum.items.len <= tc.index) {
+                        try tc_accum.append(scratch, .{
+                            .id = .empty,
+                            .name = .empty,
+                            .arguments = .empty,
+                        });
+                    }
+                    const a = &tc_accum.items[tc.index];
+                    if (tc.id) |id| try a.id.appendSlice(scratch, id);
+                    if (tc.function) |f| {
+                        if (f.name) |n| try a.name.appendSlice(scratch, n);
+                        if (f.arguments) |args| try a.arguments.appendSlice(scratch, args);
+                    }
+                }
+            }
+
+            // One flush per SSE chunk — batches all token writes above into
+            // a single syscall instead of one per fragment.
+            if (token_writer) |w| try w.flush();
         }
-        if (parsed.value.choices.len == 0) return error.ApiError;
 
-        return toAgentMessage(gpa, parsed.value.choices[0].message);
+        if (in_thinking) {
+            if (token_writer) |w| {
+                try w.writeAll("\x1b[0m\n");
+                try w.flush();
+            }
+        }
+
+        // Build result with all strings owned by gpa (arena freed after this).
+        var calls: std.ArrayList(ToolCall) = .empty;
+        for (tc_accum.items) |a| {
+            try calls.append(gpa, .{
+                .id = try gpa.dupe(u8, a.id.items),
+                .name = try gpa.dupe(u8, a.name.items),
+                .arguments_json = try gpa.dupe(u8, a.arguments.items),
+            });
+        }
+
+        return .{
+            .role = .assistant,
+            .content = try gpa.dupe(u8, content_buf.items),
+            .tool_calls = calls.items,
+        };
     }
 };
 
-/// Offline provider for testing the orchestrator without network access: it
-/// plays back a fixed script of assistant messages, one per call to `chat`.
+/// Offline provider for orchestrator tests — plays back a fixed script.
+/// Ignores `token_writer` since there's nothing to stream.
 pub const Mock = struct {
     script: []const Message,
     next: usize = 0,
@@ -257,10 +372,12 @@ pub const Mock = struct {
         io: Io,
         messages: []const Message,
         tools: []const tool.Descriptor,
+        token_writer: ?*std.Io.Writer,
     ) anyerror!Message {
         _ = io;
         _ = messages;
         _ = tools;
+        _ = token_writer;
         if (self.next >= self.script.len) return error.MockScriptExhausted;
         const m = self.script[self.next];
         self.next += 1;
