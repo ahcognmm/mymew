@@ -178,19 +178,49 @@ pub const Tui = struct {
         self.rawWrite(s);
     }
 
+    /// Runs in the primary screen buffer (not the alternate screen) so the
+    /// terminal's own scrollback keeps working for the message history —
+    /// avoids the "wheel scroll becomes arrow-key escape codes" behavior
+    /// terminals apply while an app holds the alternate screen.
     pub fn enter(self: *Tui) void {
-        self.rawWrite("\x1b[?1049h"); // alternate screen
-        self.rawWrite("\x1b[2J"); // clear
-        self.rawWrite("\x1b[1;1H"); // cursor to top-left
         self.setScrollRegion();
-        self.rawWrite("\x1b7"); // DECSC: save initial msg cursor (top of scroll region)
+        self.rawWrite("\x1b7"); // DECSC: bookmark current cursor as msg-insertion point
         self.drawStatusLine(false);
         self.drawInputLine();
     }
 
     pub fn leave(self: *Tui) void {
         self.rawWrite("\x1b[r"); // reset scroll region
-        self.rawWrite("\x1b[?1049l"); // exit alternate screen
+        self.rawWrite("\r\n"); // drop below the input line so the shell prompt lands clean
+    }
+
+    /// Recomputes terminal geometry after a SIGWINCH and re-anchors the
+    /// scroll region / status / input lines. The message-insertion bookmark
+    /// is reset to a fresh line rather than preserved exactly, since we keep
+    /// no in-memory transcript to reflow against the new size.
+    pub fn handleResize(self: *Tui, thinking: bool) void {
+        const old_rows = self.rows;
+        const size = getTermSize(self.stdout_fd);
+        self.rows = size.rows;
+        self.cols = size.cols;
+
+        // A resize doesn't move existing on-screen content — it only changes
+        // how many rows are visible. If the terminal grew, the previous
+        // status/input rows now sit inside the (larger) message area and
+        // would otherwise linger as stray leftover text, so erase them at
+        // their old absolute position before moving on. (If it shrank
+        // instead, these rows are off-screen and addressing them is a
+        // harmless no-op / gets clamped by the terminal.)
+        self.writeFmt("\x1b[{d};1H", .{if (old_rows > 1) old_rows - 1 else 1});
+        self.rawWrite("\x1b[2K");
+        self.writeFmt("\x1b[{d};1H", .{old_rows});
+        self.rawWrite("\x1b[2K");
+
+        self.setScrollRegion();
+        self.rawWrite("\r\n");
+        self.rawWrite("\x1b7"); // DECSC: re-bookmark msg-insertion point here
+        self.drawStatusLine(thinking);
+        self.drawInputLine();
     }
 
     fn msgBottom(self: *Tui) u16 {
@@ -270,8 +300,13 @@ pub const Tui = struct {
     }
 
     /// Returns true if user pressed Enter with non-empty input.
+    ///
+    /// Callers must intercept a leading ESC (27) themselves via
+    /// `swallowEscapeSequence` before reaching here — see that function's
+    /// doc comment for why this can't be done statefully inside `handleKey`.
     pub fn handleKey(self: *Tui, key: u8) bool {
         switch (key) {
+            27 => return false, // stray ESC that reached us anyway: no-op
             '\r', '\n' => {
                 if (self.input.items.len == 0) return false;
                 // Echo "You: ..." in the scroll region, restore msg cursor first
@@ -308,6 +343,55 @@ pub const Tui = struct {
         return text;
     }
 };
+
+/// Drains a CSI/SS3 escape sequence (arrow keys, Home/End, Page Up/Down,
+/// function keys, ...) that immediately follows an ESC byte already read
+/// from `fd`, so none of its bytes leak into the input field as literal
+/// characters. Uses a zero-timeout poll rather than a stateful flag carried
+/// across event-loop iterations: a lone Escape keypress has no follow-up
+/// bytes queued yet, so a blocking wait-for-next-byte approach cannot tell
+/// "standalone Escape" apart from "sequence introducer" without either
+/// misinterpreting a later, unrelated keystroke as part of the sequence or
+/// adding an artificial delay. Peeking non-blockingly resolves this
+/// immediately: if nothing is queued right after ESC, it's a standalone
+/// Escape (no-op, nothing consumed).
+pub fn swallowEscapeSequence(fd: posix.fd_t) void {
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    if ((posix.poll(&pfd, 0) catch 0) <= 0) return;
+
+    var b: [1]u8 = undefined;
+    if (std.c.read(fd, &b, 1) <= 0) return;
+    if (b[0] != '[' and b[0] != 'O') return; // not a CSI/SS3 introducer
+
+    while ((posix.poll(&pfd, 0) catch 0) > 0) {
+        if (std.c.read(fd, &b, 1) <= 0) return;
+        if (b[0] >= 0x40 and b[0] <= 0x7E) return; // final byte: sequence done
+    }
+}
+
+// ─── terminal resize (SIGWINCH) ────────────────────────────────────────────────
+
+var resize_pending: std.atomic.Value(bool) = .init(false);
+
+fn onSigwinch(_: posix.SIG) callconv(.c) void {
+    resize_pending.store(true, .release);
+}
+
+/// Installs a SIGWINCH handler that just raises a flag; call `takeResized()`
+/// from the render loop to consume it (signal-safe: no allocation, no I/O).
+pub fn installResizeHandler() void {
+    const act: posix.Sigaction = .{
+        .handler = .{ .handler = &onSigwinch },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.WINCH, &act, null);
+}
+
+/// Returns true (once) if a resize was signaled since the last call.
+pub fn takeResized() bool {
+    return resize_pending.swap(false, .acq_rel);
+}
 
 // ─── shared agent state ───────────────────────────────────────────────────────
 
