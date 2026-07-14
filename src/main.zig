@@ -14,16 +14,44 @@ const read_file = @import("plugins/tools/read_file.zig");
 const write_file = @import("plugins/tools/write_file.zig");
 const list_files = @import("plugins/tools/list_files.zig");
 const execute_command = @import("plugins/tools/execute_command.zig");
-const tui_mod = @import("tui.zig");
+const tui_mod = @import("tui/app.zig");
 
 const Tools = .{ calculator, word_count, read_file, write_file, list_files, execute_command };
 const Agent = agent_mod.Agent(Tools, llm.Glm);
+
+const Cli = struct {
+    prompt: ?[]const u8 = null,
+    session: ?[]const u8 = null,
+};
+
+fn parseCli(args: std.process.Args) !Cli {
+    var cli: Cli = .{};
+    var it = args.iterate();
+    _ = it.next(); // argv[0]
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--prompt")) {
+            cli.prompt = it.next() orelse return error.MissingPromptValue;
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--session")) {
+            cli.session = it.next() orelse return error.MissingSessionValue;
+        }
+    }
+    return cli;
+}
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+
+    const cli = parseCli(init.minimal.args) catch {
+        const stderr = std.Io.File.stderr();
+        var buf: [256]u8 = undefined;
+        var w = stderr.writerStreaming(io, &buf);
+        try w.interface.writeAll("Usage: mymew [-p <prompt>] [-s <session-id>]\n");
+        try w.interface.flush();
+        return;
+    };
 
     var glm = llm.Glm.fromEnv(init.environ_map) catch {
         const stdout = std.Io.File.stdout();
@@ -37,17 +65,45 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    const memory_path = init.environ_map.get("MYMEW_MEMORY_PATH") orelse "mymew_memory.jsonl";
+    const memory_path = if (cli.session) |s|
+        try std.fmt.allocPrint(init.arena.allocator(), "mymew_session_{s}.jsonl", .{s})
+    else
+        init.environ_map.get("MYMEW_MEMORY_PATH") orelse "mymew_memory.jsonl";
+
     var mem = try memory.Memory.init(gpa, io, memory_path);
     defer mem.deinit();
 
+    if (cli.prompt) |prompt| {
+        return runHeadless(gpa, io, &glm, &mem, prompt);
+    }
+    return runInteractive(gpa, io, &glm, &mem);
+}
+
+/// One-shot, non-interactive turn: run the same ReAct engine as the TUI, but
+/// print streamed tokens straight to stdout and exit — no raw mode, no
+/// threads, no render loop. Lets the agent be driven as a plain CLI tool
+/// (e.g. scripted, piped) instead of only through the TUI frontend.
+fn runHeadless(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memory.Memory, prompt: []const u8) !void {
+    var eng = Agent.EngineT.init(gpa, io, glm, mem);
+
+    const stdout = std.Io.File.stdout();
+    var buf: [4096]u8 = undefined;
+    var w = stdout.writerStreaming(io, &buf);
+
+    _ = eng.step(prompt, &w.interface) catch |err| {
+        try w.interface.print("[error: {s}]\n", .{@errorName(err)});
+    };
+    try w.interface.flush();
+}
+
+fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memory.Memory) !void {
     // Self-pipe for waking up the poll() in the render loop
     var pipe_fds: [2]posix.fd_t = undefined;
     if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var agent = Agent.init(gpa, io, &glm, &mem, pipe_fds[1]);
+    var agent = Agent.init(gpa, io, glm, mem, pipe_fds[1]);
     defer agent.deinit();
 
     const stdin_fd: posix.fd_t = 0;
@@ -63,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
     ui.enter();
     defer ui.leave();
 
-    tui_mod.installResizeHandler();
+    tui_mod.installResizeHandler(pipe_fds[1]);
 
     try agent.spawn();
 
@@ -126,7 +182,13 @@ pub fn main(init: std.process.Init) !void {
             }
 
             if (key == 27) {
-                tui_mod.swallowEscapeSequence(stdin_fd);
+                switch (tui_mod.readEscapeSequence(stdin_fd)) {
+                    .up => ui.scrollLine(.up),
+                    .down => ui.scrollLine(.down),
+                    .page_up => ui.scrollPage(.up),
+                    .page_down => ui.scrollPage(.down),
+                    .none => {},
+                }
             } else {
                 const submitted = ui.handleKey(key);
                 if (submitted) {

@@ -75,7 +75,10 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
         /// `writer`, if non-null, receives streaming content tokens from the
         /// provider and tool-dispatch progress lines as they happen.
         pub fn step(self: *Self, user_text: ?[]const u8, writer: ?*Io.Writer) !Outcome {
-            if (user_text) |t| try self.mem.append(Message.user(try self.gpa.dupe(u8, t)));
+            // `Memory.append` deep-copies into its own arena, so `t` only
+            // needs to stay valid for the duration of this call — no need
+            // for our own throwaway dupe here.
+            if (user_text) |t| try self.mem.append(Message.user(t));
 
             // Known-good boundary: if we have to escalate, everything from
             // here onward (this turn's malformed attempts) gets pruned.
@@ -87,11 +90,15 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
 
                 if (reply.tool_calls.len == 0) {
                     try self.mem.append(reply);
+                    // Return the arena-owned copy Memory just made, not
+                    // `reply.content` itself — we're about to free that.
+                    const stored_content = self.mem.items()[self.mem.items().len - 1].content;
+                    freeReply(self.gpa, reply);
                     if (writer) |w| {
                         try w.writeAll("\n");
                         try w.flush();
                     }
-                    return .{ .final = reply.content };
+                    return .{ .final = stored_content };
                 }
 
                 try self.mem.append(reply);
@@ -116,6 +123,12 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
                                 .name = tc.name,
                                 .content = s,
                             });
+                            // Every tool's execute() allocates its result via
+                            // the passed-in gpa (checked at each call site);
+                            // the sole exception is tool.invoke's own
+                            // innermost OOM fallback literal, which would
+                            // already be a lost cause before reaching here.
+                            self.gpa.free(s);
                         },
                         .invalid_args => |e| {
                             last_failure = result;
@@ -134,6 +147,7 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
                                 .name = tc.name,
                                 .content = diag,
                             });
+                            self.gpa.free(diag);
                         },
                     }
                 }
@@ -145,10 +159,31 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type) type {
                             try w.print("[escalating after {d} retries]\n", .{max_retries});
                             try w.flush();
                         }
-                        return try self.escalate(turn_start, f.invalid_args);
+                        // escalate() copies what it needs out of `f`
+                        // (which aliases reply.tool_calls) before we free.
+                        const outcome = try self.escalate(turn_start, f.invalid_args);
+                        freeReply(self.gpa, reply);
+                        return outcome;
                     }
                 }
+                freeReply(self.gpa, reply);
             }
+        }
+
+        /// Frees the gpa-owned string data a `Provider.chat` reply carries
+        /// (content + each tool call's fields), once `Memory.append` has
+        /// taken its own independent copy and any tool-dispatch loop that
+        /// reads `reply.tool_calls` has finished. Does not touch
+        /// `tool_call_id`/`name` — providers never populate those with
+        /// allocated memory on a reply.
+        fn freeReply(gpa: std.mem.Allocator, msg: Message) void {
+            if (msg.content.len > 0) gpa.free(msg.content);
+            for (msg.tool_calls) |tc| {
+                if (tc.id.len > 0) gpa.free(tc.id);
+                if (tc.name.len > 0) gpa.free(tc.name);
+                if (tc.arguments_json.len > 0) gpa.free(tc.arguments_json);
+            }
+            if (msg.tool_calls.len > 0) gpa.free(msg.tool_calls);
         }
 
         /// "Graceful Escalation & Context Pruning" (design doc §3.3): stops

@@ -3,7 +3,7 @@ const posix = std.posix;
 const Io = std.Io;
 const engine = @import("engine.zig");
 const memory = @import("memory.zig");
-const tui_mod = @import("../tui.zig");
+const io_bus = @import("io_bus.zig");
 
 /// Owns the ReAct `Engine` plus the background-thread lifecycle that runs it
 /// (design doc §5.2, "Background Thread: Runs the ReAct Orchestrator").
@@ -19,8 +19,8 @@ pub fn Agent(comptime Tools: anytype, comptime Provider: type) type {
         io: Io,
         eng: EngineT,
 
-        state: tui_mod.AgentState = .{},
-        channel: tui_mod.Channel,
+        state: io_bus.AgentState = .{},
+        channel: io_bus.Channel,
         wakeup_write: posix.fd_t,
 
         pub fn init(
@@ -34,7 +34,7 @@ pub fn Agent(comptime Tools: anytype, comptime Provider: type) type {
                 .gpa = gpa,
                 .io = io,
                 .eng = EngineT.init(gpa, io, provider, mem),
-                .channel = tui_mod.Channel.init(gpa),
+                .channel = io_bus.Channel.init(gpa),
                 .wakeup_write = wakeup_write,
             };
         }
@@ -69,7 +69,7 @@ pub fn Agent(comptime Tools: anytype, comptime Provider: type) type {
         fn run(self: *Self) void {
             const io = self.io;
             var cw_buf: [0]u8 = undefined;
-            var cw = tui_mod.ChannelWriter.init(io, &self.channel, self.wakeup_write, &cw_buf);
+            var cw = io_bus.ChannelWriter.init(io, &self.channel, self.wakeup_write, &cw_buf);
             const token_writer = &cw.writer;
 
             while (true) {

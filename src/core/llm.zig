@@ -355,7 +355,11 @@ pub const Glm = struct {
         return .{
             .role = .assistant,
             .content = try gpa.dupe(u8, content_buf.items),
-            .tool_calls = calls.items,
+            // toOwnedSlice (not `.items`) so the returned slice's allocation
+            // is exactly `len` long — callers free it with a plain
+            // `gpa.free()`, which would panic ("Invalid free") against an
+            // ArrayList's possibly-larger-than-`len` backing capacity.
+            .tool_calls = try calls.toOwnedSlice(gpa),
         };
     }
 };
@@ -385,13 +389,23 @@ pub const Mock = struct {
     }
 };
 
+/// Mirrors `Glm.chat`'s ownership contract: content and every tool call
+/// field come back freshly gpa-allocated, never aliased to the script's own
+/// (often literal) strings, so callers can free a reply the same way
+/// regardless of which provider produced it.
 fn dupeMessage(gpa: std.mem.Allocator, m: Message) !Message {
     var calls: std.ArrayList(ToolCall) = .empty;
-    for (m.tool_calls) |tc| try calls.append(gpa, tc);
+    for (m.tool_calls) |tc| {
+        try calls.append(gpa, .{
+            .id = try gpa.dupe(u8, tc.id),
+            .name = try gpa.dupe(u8, tc.name),
+            .arguments_json = try gpa.dupe(u8, tc.arguments_json),
+        });
+    }
     return .{
         .role = m.role,
-        .content = m.content,
-        .tool_calls = calls.items,
+        .content = try gpa.dupe(u8, m.content),
+        .tool_calls = try calls.toOwnedSlice(gpa),
         .tool_call_id = m.tool_call_id,
         .name = m.name,
     };

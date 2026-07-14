@@ -50,9 +50,35 @@ pub const Memory = struct {
 
     /// Instant append: adds to the active context and writes one new line
     /// to the physical file without touching what's already there.
+    ///
+    /// Deep-copies `msg`'s string data into Memory's own arena first, so
+    /// Memory never aliases caller-owned memory beyond this call — the
+    /// caller is free to free (or let go out of scope) whatever allocator
+    /// it used to build `msg` immediately after this returns.
     pub fn append(self: *Memory, msg: Message) !void {
-        try self.messages.append(self.arena.allocator(), msg);
-        try self.appendLine(msg);
+        const owned = try self.dupeMessage(msg);
+        try self.messages.append(self.arena.allocator(), owned);
+        try self.appendLine(owned);
+    }
+
+    fn dupeMessage(self: *Memory, msg: Message) !Message {
+        const a = self.arena.allocator();
+        var copy = msg;
+        copy.content = try a.dupe(u8, msg.content);
+        copy.tool_call_id = try a.dupe(u8, msg.tool_call_id);
+        copy.name = try a.dupe(u8, msg.name);
+        if (msg.tool_calls.len > 0) {
+            const calls = try a.alloc(message.ToolCall, msg.tool_calls.len);
+            for (msg.tool_calls, calls) |src, *dst| {
+                dst.* = .{
+                    .id = try a.dupe(u8, src.id),
+                    .name = try a.dupe(u8, src.name),
+                    .arguments_json = try a.dupe(u8, src.arguments_json),
+                };
+            }
+            copy.tool_calls = calls;
+        }
+        return copy;
     }
 
     fn appendLine(self: *Memory, msg: Message) !void {
@@ -70,7 +96,10 @@ pub const Memory = struct {
     /// the physical .jsonl file from scratch to match.
     pub fn prune(self: *Memory, new_messages: []const Message) !void {
         self.messages.clearRetainingCapacity();
-        for (new_messages) |m| try self.messages.append(self.arena.allocator(), m);
+        for (new_messages) |m| {
+            const owned = try self.dupeMessage(m);
+            try self.messages.append(self.arena.allocator(), owned);
+        }
         try self.rewrite();
     }
 
