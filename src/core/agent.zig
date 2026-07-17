@@ -5,6 +5,15 @@ const engine = @import("engine.zig");
 const memory = @import("memory.zig");
 const io_bus = @import("io_bus.zig");
 
+/// SGR markers bracketing an error/diagnostic span in the token stream —
+/// escalation reports and turn-level errors. Dim red is both a sane visible
+/// fallback for a plain consumer of the stream AND the sequence
+/// `tui/app.zig` recognizes to draw its red error gutter (same convention
+/// as `llm.zig`'s `\x1b[2;3m` thinking markers; the literals are duplicated
+/// there, never imported, to keep `app.zig` free of `core/*`).
+const error_start_sgr = "\x1b[2;31m";
+const error_end_sgr = "\x1b[0m";
+
 /// Owns the ReAct `Engine` plus the background-thread lifecycle that runs it
 /// (design doc §5.2, "Background Thread: Runs the ReAct Orchestrator").
 ///
@@ -70,6 +79,14 @@ pub fn Agent(comptime Tools: anytype, comptime Provider: type, comptime Hooks: a
             self.state.cond.signal(self.io);
         }
 
+        /// Asks the currently running turn (if any) to stop at its next
+        /// loop boundary (design doc §3.4). Thread-safe — meant to be
+        /// called directly from the render thread, same convention as
+        /// `eng.setStyle`.
+        pub fn requestCancel(self: *Self) void {
+            self.eng.requestCancel();
+        }
+
         fn run(self: *Self) void {
             const io = self.io;
             var cw_buf: [0]u8 = undefined;
@@ -99,10 +116,28 @@ pub fn Agent(comptime Tools: anytype, comptime Provider: type, comptime Hooks: a
                 if (self.eng.step(text, token_writer)) |outcome| {
                     // `.final` was already streamed via `token_writer` as it
                     // was generated; `.escalated`'s report string is
-                    // gpa-owned and ours to free (see `Engine.Outcome`).
-                    if (outcome == .escalated) self.gpa.free(outcome.escalated);
+                    // gpa-owned and ours to free (see `Engine.Outcome`) —
+                    // but first it gets streamed to the UI inside an error
+                    // span (§3.3, "Transparent Escalation": the report must
+                    // reach the user, not just the return value).
+                    if (outcome == .escalated) {
+                        const msg = std.fmt.allocPrint(
+                            self.gpa,
+                            "\n" ++ error_start_sgr ++ "{s}" ++ error_end_sgr ++ "\n",
+                            .{outcome.escalated},
+                        ) catch "";
+                        if (msg.len > 0) {
+                            self.channel.push(io, msg) catch {};
+                            self.gpa.free(msg);
+                        }
+                        self.gpa.free(outcome.escalated);
+                    }
                 } else |err| {
-                    const msg = std.fmt.allocPrint(self.gpa, "\r\n[error: {s}]\r\n", .{@errorName(err)}) catch "";
+                    const msg = std.fmt.allocPrint(
+                        self.gpa,
+                        "\n" ++ error_start_sgr ++ "[error: {s}]" ++ error_end_sgr ++ "\n",
+                        .{@errorName(err)},
+                    ) catch "";
                     self.channel.push(io, msg) catch {};
                     self.gpa.free(msg);
                 }

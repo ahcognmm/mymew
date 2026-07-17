@@ -5,6 +5,18 @@ pub const std_options: std.Options = .{
     .log_level = .warn,
 };
 
+/// Root panic handler: restore the terminal (leave alt screen, re-enable
+/// the cursor, undo raw mode) BEFORE the default handler prints the trace.
+/// Zig panics don't run `defer`s, so without this a panic would exit with
+/// raw mode + alt screen still active — terminal unusable, trace invisible.
+/// `emergencyRestore` is a no-op unless `runInteractive` registered state.
+pub const panic = std.debug.FullPanic(panicImpl);
+
+fn panicImpl(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    tui_mod.emergencyRestore();
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
 const agent_mod = @import("core/agent.zig");
 const engine = @import("core/engine.zig");
 const llm = @import("core/llm.zig");
@@ -106,7 +118,25 @@ pub fn main(init: std.process.Init) !void {
     if (cli.prompt) |prompt| {
         return runHeadless(gpa, io, &glm, &mem, prompt, cli.style);
     }
-    return runInteractive(gpa, io, &glm, &mem, cli.style);
+
+    // NO_COLOR (no-color.org: any non-empty value) and TERM=dumb both get
+    // the monochrome theme — chrome uncolored, streamed SGR stripped at
+    // render time.
+    const no_color = blk: {
+        if (init.environ_map.get("NO_COLOR")) |v| {
+            if (v.len > 0) break :blk true;
+        }
+        if (init.environ_map.get("TERM")) |t| {
+            if (std.mem.eql(u8, t, "dumb")) break :blk true;
+        }
+        break :blk false;
+    };
+    const session_label = cli.session orelse "default";
+    return runInteractive(gpa, io, &glm, &mem, cli.style, .{
+        .theme = tui_mod.Theme.init(!no_color),
+        .model_label = glm.model,
+        .session_label = session_label,
+    });
 }
 
 /// One-shot, non-interactive turn: run the same orchestrator as the TUI, but
@@ -122,16 +152,26 @@ fn runHeadless(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memory.M
     var w = stdout.writerStreaming(io, &buf);
 
     if (eng.step(prompt, &w.interface)) |outcome| {
-        // `.final` was already streamed to stdout as it was generated;
-        // `.escalated`'s report string is gpa-owned and ours to free.
-        if (outcome == .escalated) gpa.free(outcome.escalated);
+        // `.final` was already streamed to stdout as it was generated.
+        // `.escalated`'s report is gpa-owned and ours to free — after
+        // printing it (§3.3: the failure report must reach the user).
+        if (outcome == .escalated) {
+            try w.interface.print("\n{s}\n", .{outcome.escalated});
+            gpa.free(outcome.escalated);
+        }
     } else |err| {
         try w.interface.print("[error: {s}]\n", .{@errorName(err)});
     }
     try w.interface.flush();
 }
 
-fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memory.Memory, style: engine.Style) !void {
+const InteractiveOpts = struct {
+    theme: tui_mod.Theme,
+    model_label: []const u8,
+    session_label: []const u8,
+};
+
+fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memory.Memory, style: engine.Style, opts: InteractiveOpts) !void {
     // Self-pipe for waking up the poll() in the render loop
     var pipe_fds: [2]posix.fd_t = undefined;
     if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
@@ -145,16 +185,25 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
     const stdin_fd: posix.fd_t = 0;
     const stdout_fd: posix.fd_t = 1;
 
-    // Raw mode
+    // Raw mode; register the same state with the panic path so a crash
+    // anywhere below still leaves the terminal usable.
     const orig_termios = try tui_mod.enableRawMode(stdin_fd);
     defer tui_mod.disableRawMode(stdin_fd, orig_termios);
+    tui_mod.registerPanicRestore(stdin_fd, stdout_fd, orig_termios);
 
-    var ui = try tui_mod.Tui.init(gpa, stdout_fd);
+    var ui = try tui_mod.Tui.init(gpa, stdout_fd, opts.theme);
     defer ui.deinit();
+    ui.setContext(opts.model_label, opts.session_label);
+    ui.plan_execute = style == .plan_execute;
+
+    // Seed prompt history from hydrated memory, so ↑ recalls prompts from
+    // previous sessions of this transcript too.
+    for (mem.items()) |m| {
+        if (m.role == .user) ui.pushHistory(m.content);
+    }
 
     ui.enter();
     defer ui.leave();
-    ui.setStyle(style == .plan_execute, false);
 
     tui_mod.installResizeHandler(pipe_fds[1]);
 
@@ -171,7 +220,7 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
 
     var running = true;
     while (running) {
-        _ = posix.poll(&poll_fds, 400) catch 0; // 400ms for dot animation
+        _ = posix.poll(&poll_fds, 400) catch 0; // 400ms for spinner/dot animation
 
         // Drain wakeup pipe
         if (poll_fds[1].revents & posix.POLL.IN != 0) {
@@ -180,7 +229,7 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
         }
 
         if (tui_mod.takeResized()) {
-            ui.handleResize(agent.state.thinking.load(.acquire));
+            ui.handleResize();
         }
 
         // Check if agent finished
@@ -195,16 +244,11 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
             // Drain pending tokens from channel
             drain_buf.clearRetainingCapacity();
             _ = agent.channel.drain(io, &drain_buf, gpa) catch {};
-            if (drain_buf.items.len > 0) {
-                const thinking = agent.state.thinking.load(.acquire);
-                ui.appendOutput(drain_buf.items);
-                if (thinking) ui.onAgentStart(true);
-            }
+            if (drain_buf.items.len > 0) ui.appendOutput(drain_buf.items);
         }
 
-        // Animate dots while thinking
-        const thinking = agent.state.thinking.load(.acquire);
-        _ = ui.tickDots(thinking);
+        ui.setBusy(agent.state.thinking.load(.acquire));
+        _ = ui.tickDots();
 
         // Handle keypress
         if (poll_fds[0].revents & posix.POLL.IN != 0) {
@@ -218,29 +262,85 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
                 break;
             }
 
-            if (key == 16) { // Ctrl+P: toggle orchestration style
-                const cur = agent.eng.style.load(.acquire);
-                const next: engine.Style = if (cur == .react) .plan_execute else .react;
-                agent.eng.setStyle(next);
-                ui.setStyle(next == .plan_execute, agent.state.thinking.load(.acquire));
-            } else if (key == 27) {
-                switch (tui_mod.readEscapeSequence(stdin_fd)) {
-                    .up => ui.scrollLine(.up),
-                    .down => ui.scrollLine(.down),
-                    .page_up => ui.scrollPage(.up),
-                    .page_down => ui.scrollPage(.down),
-                    .none => {},
-                }
-            } else {
-                const submitted = ui.handleKey(key);
-                if (submitted) {
-                    const text = ui.takeInput();
-                    if (text.len > 0) {
-                        ui.beginTurn();
-                        ui.onAgentStart(false);
-                        agent.submit(text);
+            // Any key (except quit above) dismisses the help overlay.
+            // Escape sequences still get read so their bytes don't leak
+            // into the composer; wheel events don't dismiss.
+            if (ui.help_visible) {
+                if (key == 27) {
+                    switch (tui_mod.readEscapeSequence(stdin_fd)) {
+                        .wheel_up, .wheel_down => continue,
+                        else => {},
                     }
                 }
+                ui.toggleHelp();
+                continue;
+            }
+
+            switch (key) {
+                16 => { // Ctrl+P: toggle orchestration style
+                    const cur = agent.eng.style.load(.acquire);
+                    const next: engine.Style = if (cur == .react) .plan_execute else .react;
+                    agent.eng.setStyle(next);
+                    ui.setStyle(next == .plan_execute);
+                },
+                7 => ui.toggleHelp(), // Ctrl+G
+                12 => ui.redraw(), // Ctrl+L
+                26 => { // Ctrl+Z: suspend properly, resume with a full redraw
+                    ui.leave();
+                    tui_mod.disableRawMode(stdin_fd, orig_termios);
+                    _ = std.c.raise(posix.SIG.TSTP);
+                    // ...stopped; resumed here on SIGCONT.
+                    _ = tui_mod.enableRawMode(stdin_fd) catch {};
+                    ui.enter();
+                    ui.handleResize(); // window may have changed while stopped
+                },
+                27 => switch (tui_mod.readEscapeSequence(stdin_fd)) {
+                    // Esc priority chain: cancel a running turn, else jump
+                    // a scrolled viewport back to the tail, else clear the
+                    // composer.
+                    .escape => {
+                        if (agent.state.thinking.load(.acquire)) {
+                            agent.requestCancel();
+                            ui.setCancelling();
+                        } else if (ui.scrolled()) {
+                            ui.jumpTail();
+                        } else {
+                            ui.clearComposer();
+                        }
+                    },
+                    .up => ui.composerMove(.up),
+                    .down => ui.composerMove(.down),
+                    .left => ui.composerMove(.left),
+                    .right => ui.composerMove(.right),
+                    .home => ui.composerMove(.home),
+                    .end_key => ui.composerMove(.end),
+                    .delete => ui.composerMove(.delete),
+                    .alt_enter => ui.insertNewline(),
+                    .page_up => ui.scrollPage(.up),
+                    .page_down => ui.scrollPage(.down),
+                    .wheel_up => {
+                        ui.scrollLine(.up);
+                        ui.scrollLine(.up);
+                        ui.scrollLine(.up);
+                    },
+                    .wheel_down => {
+                        ui.scrollLine(.down);
+                        ui.scrollLine(.down);
+                        ui.scrollLine(.down);
+                    },
+                    .none => {},
+                },
+                else => {
+                    const submitted = ui.handleKey(key);
+                    if (submitted) {
+                        const text = ui.takeInput();
+                        if (text.len > 0) {
+                            ui.beginTurn();
+                            ui.setBusy(true);
+                            agent.submit(text);
+                        }
+                    }
+                },
             }
         }
     }

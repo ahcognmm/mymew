@@ -43,67 +43,400 @@ pub fn getTermSize(fd: posix.fd_t) struct { rows: u16, cols: u16 } {
     };
 }
 
-// ─── TUI state ────────────────────────────────────────────────────────────────
+// ─── panic-safe terminal restoration ─────────────────────────────────────────
+//
+// Zig panics do not run `defer`s, so without this a panic exits with raw
+// mode + the alternate screen still active — the terminal is left unusable
+// and the panic trace lands invisibly on the alt screen. `main.zig`'s root
+// panic handler calls `emergencyRestore()` before the default handler
+// prints. Globals (not Tui fields) because a panic handler has no access
+// to stack state; write() and tcsetattr are async-signal-safe.
 
-/// A single wrapped physical row: a byte span into `Tui.transcript`. Stored as
-/// offsets rather than slices because `transcript` is an ArrayList that can
-/// reallocate on append — slices taken before a realloc would dangle.
-/// `is_thinking` marks rows that fall inside a provider-marked reasoning
-/// span (see `wrapLogicalLine`), so `renderMessages` can draw the left-hand
-/// gutter — that decoration is a TUI concern, not something the provider
-/// should embed into the byte stream itself.
-const Row = struct { start: usize, len: usize, is_thinking: bool = false };
+var restore_in_fd: posix.fd_t = -1;
+var restore_out_fd: posix.fd_t = -1;
+var restore_termios: ?posix.termios = null;
+
+pub fn registerPanicRestore(in_fd: posix.fd_t, out_fd: posix.fd_t, orig: posix.termios) void {
+    restore_in_fd = in_fd;
+    restore_out_fd = out_fd;
+    restore_termios = orig;
+}
+
+/// Leaves the alt screen, disables mouse reporting, shows the cursor, and
+/// restores the original termios. Safe to call multiple times or when
+/// nothing was registered (no-op). Idempotent on purpose: it runs both from
+/// the panic path and (harmlessly) after a clean `leave()`.
+pub fn emergencyRestore() void {
+    if (restore_out_fd >= 0) {
+        const seq = "\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[?25h";
+        _ = std.c.write(restore_out_fd, seq, seq.len);
+    }
+    if (restore_termios) |orig| {
+        if (restore_in_fd >= 0) posix.tcsetattr(restore_in_fd, .FLUSH, orig) catch {};
+    }
+}
+
+// ─── theme ────────────────────────────────────────────────────────────────────
+
+/// Semantic color tokens for everything the TUI itself draws (chrome,
+/// prompt, gutters, "You:" label). With `colors == false` (NO_COLOR /
+/// TERM=dumb) every token is empty AND transcript bytes are stripped of
+/// SGR sequences at render time — the stream itself (thinking/error span
+/// markers, tool-dot units) is a wire format shared with `core/*` writers
+/// and is never themed; only what reaches the terminal changes.
+pub const Theme = struct {
+    colors: bool,
+    bold: []const u8,
+    dim: []const u8,
+    reset: []const u8,
+    accent: []const u8, // cyan — prompt, thinking gutter, plan-panel gutter
+    err_c: []const u8, // red — error gutter
+    warn: []const u8, // yellow — busy spinner, running plan step
+    ok: []const u8, // green — completed plan step
+
+    pub fn init(colors: bool) Theme {
+        if (!colors) return .{
+            .colors = false,
+            .bold = "",
+            .dim = "",
+            .reset = "",
+            .accent = "",
+            .err_c = "",
+            .warn = "",
+            .ok = "",
+        };
+        return .{
+            .colors = true,
+            .bold = "\x1b[1m",
+            .dim = "\x1b[2m",
+            .reset = "\x1b[0m",
+            .accent = "\x1b[36m",
+            .err_c = "\x1b[31m",
+            .warn = "\x1b[33m",
+            .ok = "\x1b[32m",
+        };
+    }
+};
+
+// ─── unicode width ────────────────────────────────────────────────────────────
+
+const Decoded = struct { cp: u21, len: usize };
+
+/// Decodes one codepoint; invalid/truncated UTF-8 degrades to "one byte,
+/// width 1" so garbage input can only miswrap, never stall or split worse.
+pub fn decodeCp(bytes: []const u8) Decoded {
+    const len = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return .{ .cp = bytes[0], .len = 1 };
+    if (len > bytes.len) return .{ .cp = bytes[0], .len = 1 };
+    const cp = std.unicode.utf8Decode(bytes[0..len]) catch return .{ .cp = bytes[0], .len = 1 };
+    return .{ .cp = cp, .len = len };
+}
+
+const wide_ranges = [_][2]u21{
+    .{ 0x1100, 0x115F }, // Hangul Jamo
+    .{ 0x231A, 0x231B }, .{ 0x2329, 0x232A }, .{ 0x23E9, 0x23EC },
+    .{ 0x25FD, 0x25FE }, .{ 0x2614, 0x2615 }, .{ 0x2648, 0x2653 },
+    .{ 0x26AA, 0x26AB }, .{ 0x2E80, 0x303E }, // CJK radicals, punctuation
+    .{ 0x3041, 0x33FF }, // kana, CJK symbols
+    .{ 0x3400, 0x4DBF }, .{ 0x4E00, 0x9FFF }, // CJK ideographs
+    .{ 0xA000, 0xA4CF }, // Yi
+    .{ 0xAC00, 0xD7A3 }, // Hangul syllables
+    .{ 0xF900, 0xFAFF }, .{ 0xFE30, 0xFE4F },
+    .{ 0xFF00, 0xFF60 }, .{ 0xFFE0, 0xFFE6 }, // fullwidth forms
+    .{ 0x1F300, 0x1F64F }, .{ 0x1F680, 0x1F6FF }, // emoji
+    .{ 0x1F900, 0x1FAFF },
+    .{ 0x20000, 0x3FFFD }, // CJK extensions
+};
+
+const zero_ranges = [_][2]u21{
+    .{ 0x0300, 0x036F }, .{ 0x0483, 0x0489 }, .{ 0x0591, 0x05BD },
+    .{ 0x1AB0, 0x1AFF }, .{ 0x1DC0, 0x1DFF }, .{ 0x20D0, 0x20FF },
+};
+
+/// Display width of one codepoint: 0 (combining marks, ZWJ, variation
+/// selectors), 2 (East Asian Wide/Fullwidth + emoji presentation), else 1.
+/// A compact wcwidth: grapheme clusters are not segmented (a ZWJ emoji
+/// family over-counts by design — miswrapping by a cell beats splitting
+/// mid-codepoint, see docs/feat/tui-redesign.md §6).
+pub fn charWidth(cp: u21) u2 {
+    if (cp == 0x200B or cp == 0x200C or cp == 0x200D) return 0;
+    if (cp == 0xFE0E or cp == 0xFE0F) return 0;
+    for (zero_ranges) |r| {
+        if (cp >= r[0] and cp <= r[1]) return 0;
+    }
+    for (wide_ranges) |r| {
+        if (cp >= r[0] and cp <= r[1]) return 2;
+    }
+    return 1;
+}
+
+/// Sum of `charWidth` over `text` (no escape sequences expected).
+pub fn displayWidth(text: []const u8) usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const d = decodeCp(text[i..]);
+        w += charWidth(d.cp);
+        i += d.len;
+    }
+    return w;
+}
+
+// ─── stream markers (wire format, duplicated from core/* by convention) ──────
 
 /// SGR markers a provider uses to bracket a reasoning/thinking span in the
 /// token stream (see `core/llm.zig`). The TUI watches for exactly these
 /// sequences while wrapping lines to know where to draw the thinking gutter.
 const thinking_start_sgr = "\x1b[2;3m";
-const thinking_end_sgr = "\x1b[0m";
+/// SGR markers `core/agent.zig` uses to bracket an error/diagnostic span
+/// (escalation reports, `[error: ...]` lines) — dim red as a plain-stream
+/// fallback, red gutter here.
+const error_start_sgr = "\x1b[2;31m";
+/// Ends either span kind. Shared with plain resets in the stream; a reset
+/// outside a span is a harmless none→none transition.
+const span_end_sgr = "\x1b[0m";
 
-/// Left-hand gutter drawn on every physical row of a thinking span: a cyan
-/// vertical bar plus a space, so the whole span reads as one continuous rule
-/// from top to bottom. Occupies `thinking_gutter_cols` visible columns,
-/// which `wrapLogicalLine` reserves when wrapping thinking rows.
-const thinking_gutter = "\x1b[36m\u{2502}\x1b[39m ";
-const thinking_gutter_cols: usize = 2;
-
-/// Tool-call status dot markers (see `core/engine.zig` for the writer
-/// side — kept byte-for-byte in sync there; this file has no import of it,
-/// same convention as `thinking_start_sgr` above). `tool_pending_sgr` is
-/// just the 5-byte color-set prefix `wrapLogicalLine`'s escape scanner
-/// actually matches against (it only ever sees one CSI sequence at a time,
-/// not the surrounding dot character) — which is also the first 5 bytes of
-/// every `tool_dot_len`-byte dot unit below, so recording that escape's
-/// start position gives the offset of the whole dot.
+/// Tool-call status markers (see `core/engine.zig` for the writer side —
+/// kept byte-for-byte in sync there; this file has no import of it, same
+/// convention as `thinking_start_sgr` above). All four are the same 12
+/// bytes so in-place patching never shifts anything. The finals are `✓`/`✗`
+/// (each 3-byte UTF-8, like `●`) so ok/fail stays legible without color.
 const tool_pending_sgr = "\x1b[33m";
-const tool_dot_len: usize = 12; // "\x1b[NNm" (5) + "●" (3 UTF-8 bytes) + "\x1b[0m" (4)
+const tool_dot_len: usize = 12; // "\x1b[NNm" (5) + 3-byte UTF-8 glyph + "\x1b[0m" (4)
 const tool_dot_pending_bright = "\x1b[33m\u{25CF}\x1b[0m";
 const tool_dot_pending_dim = "\x1b[90m\u{25CF}\x1b[0m";
-const tool_dot_ok = "\x1b[32m\u{25CF}\x1b[0m";
-const tool_dot_fail = "\x1b[31m\u{25CF}\x1b[0m";
-/// Zero-width, no visible content of their own — instantaneous "patch the
-/// pending dot now" signals, not a start/end pair bracketing a span.
-/// Undefined SGR sub-codes real terminals silently ignore if any of this
-/// ever leaks through unstripped.
+const tool_dot_ok = "\x1b[32m\u{2713}\x1b[0m";
+const tool_dot_fail = "\x1b[31m\u{2717}\x1b[0m";
+/// Zero-width "patch the pending dot now" signals — undefined SGR
+/// sub-codes real terminals silently ignore if they ever leak through.
 const tool_done_ok_sgr = "\x1b[900m";
 const tool_done_fail_sgr = "\x1b[901m";
 
-/// Layout:
-///   rows 1..(rows-2)  →  message viewport (owned transcript, own scrolling)
-///   row  (rows-1)     →  status line ("thinking...")
-///   row  rows         →  input line  ("> ...")
+// ─── transcript rows ──────────────────────────────────────────────────────────
+
+/// Which left-hand gutter a transcript row renders with. `.thinking` spans
+/// come from the provider's reasoning markers; `.err` spans from
+/// `core/agent.zig`'s escalation/error markers.
+pub const Gutter = enum { none, thinking, err };
+
+/// A single wrapped physical row: a byte span into `Tui.transcript`. Stored
+/// as offsets rather than slices because `transcript` is an ArrayList that
+/// can reallocate on append — slices taken before a realloc would dangle.
+const Row = struct { start: usize, len: usize, gutter: Gutter = .none };
+
+/// Gutter prefix occupies this many visible columns; `wrapLogicalLine`
+/// reserves them when wrapping guttered rows.
+const gutter_cols: usize = 2;
+
+// ─── composer ─────────────────────────────────────────────────────────────────
+
+/// One wrapped visual row of the composer: a byte span into its text.
+pub const VRow = struct { start: usize, len: usize };
+
+/// Wraps plain text (no escape sequences) into visual rows of at most
+/// `width` display columns, breaking at '\n' and at width. Always produces
+/// at least one row (possibly empty), so a cursor position always maps to
+/// a row.
+pub fn wrapPlain(gpa: std.mem.Allocator, out: *std.ArrayList(VRow), text: []const u8, width: usize) void {
+    out.clearRetainingCapacity();
+    const w_max: usize = if (width == 0) 1 else width;
+    var seg_start: usize = 0;
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '\n') {
+            out.append(gpa, .{ .start = seg_start, .len = i - seg_start }) catch return;
+            seg_start = i + 1;
+            col = 0;
+            i += 1;
+            continue;
+        }
+        const d = decodeCp(text[i..]);
+        const cw: usize = charWidth(d.cp);
+        if (col + cw > w_max and col > 0) {
+            out.append(gpa, .{ .start = seg_start, .len = i - seg_start }) catch return;
+            seg_start = i;
+            col = 0;
+        }
+        col += cw;
+        i += d.len;
+    }
+    out.append(gpa, .{ .start = seg_start, .len = text.len - seg_start }) catch return;
+}
+
+pub const RowCol = struct { row: usize, col: usize };
+
+/// Maps a byte offset (`cursor`, 0..text.len inclusive) to its visual
+/// row/column within `rows` (as produced by `wrapPlain`). At a wrap
+/// boundary the cursor belongs to the start of the *next* row, matching
+/// where the next typed character would land.
+pub fn cursorRowCol(rows: []const VRow, text: []const u8, cursor: usize) RowCol {
+    var row: usize = 0;
+    for (rows, 0..) |r, idx| {
+        if (r.start <= cursor) row = idx else break;
+    }
+    const r = rows[row];
+    const upto = @min(cursor, r.start + r.len);
+    return .{ .row = row, .col = displayWidth(text[r.start..upto]) };
+}
+
+/// Byte offset within visual row `r` whose column is closest to (but not
+/// past) `target` — for up/down movement preserving the column.
+fn byteAtCol(text: []const u8, r: VRow, target: usize) usize {
+    var col: usize = 0;
+    var i: usize = r.start;
+    const end = r.start + r.len;
+    while (i < end) {
+        const d = decodeCp(text[i..]);
+        const cw: usize = charWidth(d.cp);
+        if (col + cw > target) return i;
+        col += cw;
+        i += d.len;
+    }
+    return end;
+}
+
+/// The input editor: UTF-8 text, a byte-offset cursor (always on a
+/// codepoint boundary), and prompt history. Pure data + operations — no
+/// terminal I/O — so every editing op is unit-testable.
+pub const Composer = struct {
+    text: std.ArrayList(u8) = .empty,
+    cursor: usize = 0,
+    history: std.ArrayList([]const u8) = .empty,
+    /// null = editing live text; otherwise index into `history` currently
+    /// recalled. Any edit snaps back to live (standard readline behavior).
+    hist_idx: ?usize = null,
+    /// Live text stashed while browsing history, restored when the user
+    /// arrows back past the newest entry.
+    stash: std.ArrayList(u8) = .empty,
+
+    pub fn deinit(self: *Composer, gpa: std.mem.Allocator) void {
+        self.text.deinit(gpa);
+        for (self.history.items) |h| gpa.free(h);
+        self.history.deinit(gpa);
+        self.stash.deinit(gpa);
+    }
+
+    fn prevCpStart(text: []const u8, i: usize) usize {
+        var p = i;
+        while (p > 0) {
+            p -= 1;
+            if (text[p] & 0xC0 != 0x80) return p;
+        }
+        return 0;
+    }
+
+    pub fn insert(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) void {
+        self.text.insertSlice(gpa, self.cursor, bytes) catch return;
+        self.cursor += bytes.len;
+        self.hist_idx = null;
+    }
+
+    pub fn backspace(self: *Composer, gpa: std.mem.Allocator) void {
+        if (self.cursor == 0) return;
+        const p = prevCpStart(self.text.items, self.cursor);
+        self.text.replaceRange(gpa, p, self.cursor - p, &.{}) catch return;
+        self.cursor = p;
+        self.hist_idx = null;
+    }
+
+    pub fn deleteForward(self: *Composer, gpa: std.mem.Allocator) void {
+        if (self.cursor >= self.text.items.len) return;
+        const d = decodeCp(self.text.items[self.cursor..]);
+        self.text.replaceRange(gpa, self.cursor, d.len, &.{}) catch return;
+        self.hist_idx = null;
+    }
+
+    pub fn moveLeft(self: *Composer) void {
+        if (self.cursor > 0) self.cursor = prevCpStart(self.text.items, self.cursor);
+    }
+
+    pub fn moveRight(self: *Composer) void {
+        if (self.cursor < self.text.items.len) self.cursor += decodeCp(self.text.items[self.cursor..]).len;
+    }
+
+    pub fn lineHome(self: *Composer) void {
+        self.cursor = if (std.mem.lastIndexOfScalar(u8, self.text.items[0..self.cursor], '\n')) |p| p + 1 else 0;
+    }
+
+    pub fn lineEnd(self: *Composer) void {
+        self.cursor = std.mem.indexOfScalarPos(u8, self.text.items, self.cursor, '\n') orelse self.text.items.len;
+    }
+
+    pub fn deleteWordBack(self: *Composer, gpa: std.mem.Allocator) void {
+        if (self.cursor == 0) return;
+        var p = self.cursor;
+        while (p > 0 and self.text.items[p - 1] == ' ') p -= 1;
+        while (p > 0 and self.text.items[p - 1] != ' ' and self.text.items[p - 1] != '\n') p -= 1;
+        self.text.replaceRange(gpa, p, self.cursor - p, &.{}) catch return;
+        self.cursor = p;
+        self.hist_idx = null;
+    }
+
+    pub fn clear(self: *Composer) void {
+        self.text.clearRetainingCapacity();
+        self.cursor = 0;
+        self.hist_idx = null;
+    }
+
+    pub fn pushHistory(self: *Composer, gpa: std.mem.Allocator, entry: []const u8) void {
+        if (entry.len == 0) return;
+        if (self.history.items.len > 0 and
+            std.mem.eql(u8, self.history.items[self.history.items.len - 1], entry)) return;
+        const copy = gpa.dupe(u8, entry) catch return;
+        self.history.append(gpa, copy) catch gpa.free(copy);
+    }
+
+    pub fn historyPrev(self: *Composer, gpa: std.mem.Allocator) void {
+        if (self.history.items.len == 0) return;
+        if (self.hist_idx) |idx| {
+            if (idx == 0) return;
+            self.hist_idx = idx - 1;
+        } else {
+            self.stash.clearRetainingCapacity();
+            self.stash.appendSlice(gpa, self.text.items) catch return;
+            self.hist_idx = self.history.items.len - 1;
+        }
+        self.loadEntry(gpa, self.history.items[self.hist_idx.?]);
+    }
+
+    pub fn historyNext(self: *Composer, gpa: std.mem.Allocator) void {
+        const idx = self.hist_idx orelse return;
+        if (idx + 1 < self.history.items.len) {
+            self.hist_idx = idx + 1;
+            self.loadEntry(gpa, self.history.items[idx + 1]);
+        } else {
+            self.hist_idx = null;
+            // `loadEntry` reads `stash` while writing `text` — two distinct
+            // lists, no aliasing.
+            self.loadEntry(gpa, self.stash.items);
+        }
+    }
+
+    fn loadEntry(self: *Composer, gpa: std.mem.Allocator, entry: []const u8) void {
+        self.text.clearRetainingCapacity();
+        self.text.appendSlice(gpa, entry) catch {};
+        self.cursor = self.text.items.len;
+    }
+};
+
+// ─── TUI ──────────────────────────────────────────────────────────────────────
+
+/// Layout (bottom-up):
+///   row  rows              →  status/hint bar (contextual)
+///   rows rows-comp_h..rows-1 →  composer (1..5 rows, grows by shrinking
+///                               the transcript; prompt "❯ ")
+///   rows 1..rows-comp_h-1  →  message viewport (owned transcript,
+///                               own scrolling)
 ///
 /// Runs in the alternate screen buffer: the TUI is the sole source of truth
 /// for what's on screen, so the terminal's own scrollback/reflow is never
-/// involved and can't leak stale content into view (the class of bug the
-/// old primary-screen/scroll-region approach couldn't fully avoid).
+/// involved and can't leak stale content into view.
 pub const Tui = struct {
     gpa: std.mem.Allocator,
     rows: u16,
     cols: u16,
     stdout_fd: posix.fd_t,
-
-    input: std.ArrayList(u8),
+    theme: Theme,
 
     transcript: std.ArrayList(u8),
     rows_cache: std.ArrayList(Row),
@@ -113,55 +446,108 @@ pub const Tui = struct {
     view_start: ?usize = null,
 
     /// Whether the scan position is currently inside a provider-marked
-    /// thinking span (see `thinking_start_sgr`/`thinking_end_sgr`). Persists
-    /// across incremental `wrapLogicalLine` calls since a span can outlive
-    /// any single call as tokens stream in.
-    thinking_state: bool = false,
+    /// thinking span or an agent-marked error span. Persists across
+    /// incremental `wrapLogicalLine` calls since a span can outlive any
+    /// single call as tokens stream in.
+    gutter_state: Gutter = .none,
 
     /// Byte offset in `self.transcript` of the currently in-flight tool
     /// call's dot (see `tool_pending_sgr`), or null if no tool call is
-    /// pending. There is at most one at a time — tool calls run
-    /// sequentially, never concurrently, so no stack/map is needed. Set by
-    /// `wrapLogicalLine` on seeing `tool_pending_sgr`; cleared by
-    /// `patchToolDot` once the matching done-signal patches it to its
-    /// final color.
+    /// pending. At most one at a time — tool calls run sequentially.
     pending_tool_dot: ?usize = null,
-    /// Toggled each `tickDots` call while a tool is pending, to alternate
-    /// the dot between `tool_dot_pending_bright`/`_dim` — this file does
-    /// its own blink animation rather than relying on terminal-native SGR
-    /// blink support, which many terminals ignore.
     tool_dot_blink_on: bool = false,
 
     dot_phase: u8 = 0,
     last_dot_ns: i64 = 0,
 
-    /// Monotonic timestamp captured by `beginTurn()` when the user submits a
-    /// prompt; `onAgentDone()` diffs against it to report how long the whole
-    /// round trip (submit → final response) took.
+    /// Monotonic timestamp captured by `beginTurn()`; `onAgentDone()` diffs
+    /// against it for the round-trip time line, `drawBar` for the live
+    /// elapsed counter.
     turn_start_ns: i64 = 0,
 
-    /// Set via `setStyle()`, read directly by `drawStatusLine`. Deliberately
-    /// a plain bool, not `core.engine.Style` — this file has no dependency
-    /// on `core/*` and shouldn't gain one just for a status-line label.
+    /// Deliberately plain bools/ints, not `core.engine` types — this file
+    /// has no dependency on `core/*` and shouldn't gain one for labels.
     plan_execute: bool = false,
+    busy: bool = false,
+    cancelling: bool = false,
+    help_visible: bool = false,
+    /// Live plan progress parsed from the `[step i/n: ...]` stream markers
+    /// (0/0 = none). Feeds both the bar's `[plan i/n]` tag and the plan
+    /// panel; reset each turn.
+    plan_step_i: usize = 0,
+    plan_step_n: usize = 0,
 
-    pub fn init(gpa: std.mem.Allocator, stdout_fd: posix.fd_t) !Tui {
+    /// Plan-panel state (design doc §5.1), fed by `processStream`'s marker
+    /// filter: during a plan-execute turn the `[plan]…[/plan]` block is
+    /// diverted out of the transcript into `plan_steps`, and the
+    /// `[step]`/`[/step]`/`[synthesis]` markers drive live progress. The
+    /// panel renders between transcript and composer while `plan_phase !=
+    /// .none` and disappears when the turn ends.
+    plan_phase: enum { none, planning, executing, synthesis } = .none,
+    plan_steps: std.ArrayList([]const u8),
+    plan_current_done: bool = false,
+    /// Raw bytes captured between `[plan]` and `[/plan]`.
+    plan_buf: std.ArrayList(u8),
+    /// True while stream content is being diverted into `plan_buf`.
+    capturing_plan: bool = false,
+    /// Hold-back buffer for a line that may still turn out to be a phase
+    /// marker (`processStream`). Persists across chunk boundaries — the
+    /// engine's markers can arrive split across channel drains.
+    filter_line: std.ArrayList(u8),
+    /// Whether the next streamed byte starts a line (for marker detection).
+    line_start: bool = true,
+    /// Plan-panel height in rows for the current frame (0 = hidden);
+    /// computed by `renderAll`, read by `msgViewportRows`.
+    panel_h: u16 = 0,
+
+    /// Static context labels for the bar's right side; set once via
+    /// `setContext`, borrowed (caller keeps them alive for the whole run).
+    model_label: []const u8 = "",
+    session_label: []const u8 = "",
+
+    composer: Composer = .{},
+    comp_rows: std.ArrayList(VRow),
+    comp_scroll: usize = 0,
+    comp_h: u16 = 1,
+
+    /// Multi-byte UTF-8 input accumulation: the event loop reads stdin one
+    /// byte at a time, so a lead byte parks here until its continuation
+    /// bytes arrive.
+    pending_utf8: [4]u8 = undefined,
+    pending_utf8_len: u8 = 0,
+    pending_utf8_need: u8 = 0,
+
+    pub fn init(gpa: std.mem.Allocator, stdout_fd: posix.fd_t, theme: Theme) !Tui {
         const size = getTermSize(stdout_fd);
         return .{
             .gpa = gpa,
             .rows = size.rows,
             .cols = size.cols,
             .stdout_fd = stdout_fd,
-            .input = .empty,
+            .theme = theme,
             .transcript = .empty,
             .rows_cache = .empty,
+            .comp_rows = .empty,
+            .plan_steps = .empty,
+            .plan_buf = .empty,
+            .filter_line = .empty,
         };
     }
 
     pub fn deinit(self: *Tui) void {
-        self.input.deinit(self.gpa);
         self.transcript.deinit(self.gpa);
         self.rows_cache.deinit(self.gpa);
+        self.composer.deinit(self.gpa);
+        self.comp_rows.deinit(self.gpa);
+        self.clearPlanSteps();
+        self.plan_steps.deinit(self.gpa);
+        self.plan_buf.deinit(self.gpa);
+        self.filter_line.deinit(self.gpa);
+    }
+
+    fn clearPlanSteps(self: *Tui) void {
+        for (self.plan_steps.items) |s| self.gpa.free(s);
+        self.plan_steps.clearRetainingCapacity();
     }
 
     fn rawWrite(self: *Tui, bytes: []const u8) void {
@@ -180,57 +566,127 @@ pub const Tui = struct {
     }
 
     pub fn enter(self: *Tui) void {
-        self.rawWrite("\x1b[?1049h"); // switch to alternate screen buffer
-        self.rawWrite("\x1b[2J"); // clear it
-        self.drawStatusLine(false);
-        self.drawInputLine();
-        self.renderMessages();
+        self.rawWrite("\x1b[?1049h"); // alternate screen buffer
+        self.rawWrite("\x1b[?1000h\x1b[?1006h"); // mouse reporting (wheel scroll; SGR encoding)
+        self.rawWrite("\x1b[2J");
+        self.renderAll();
     }
 
     pub fn leave(self: *Tui) void {
+        self.rawWrite("\x1b[?1000l\x1b[?1006l"); // mouse off
+        self.rawWrite("\x1b[?25h"); // cursor back on
         self.rawWrite("\x1b[?1049l"); // restore primary screen exactly as it was
     }
 
     /// Recomputes terminal geometry after a SIGWINCH, rewraps the whole
     /// transcript at the new width, and redraws everything. Scroll position
-    /// re-pins to the live tail rather than trying to preserve it across a
-    /// rewrap (row indices from before a width change don't mean anything
-    /// after it).
-    pub fn handleResize(self: *Tui, thinking: bool) void {
+    /// re-pins to the live tail (row indices from before a width change
+    /// don't mean anything after it).
+    pub fn handleResize(self: *Tui) void {
         const size = getTermSize(self.stdout_fd);
         self.rows = size.rows;
         self.cols = size.cols;
         self.view_start = null;
         self.rebuildRowsCache();
-
         self.rawWrite("\x1b[2J");
-        self.drawStatusLine(thinking);
-        self.drawInputLine();
-        self.renderMessages();
+        self.renderAll();
+    }
+
+    pub fn setContext(self: *Tui, model: []const u8, session: []const u8) void {
+        self.model_label = model;
+        self.session_label = session;
+    }
+
+    fn tooSmall(self: *Tui) bool {
+        return self.rows < 6 or self.cols < 24;
+    }
+
+    fn compWidth(self: *Tui) usize {
+        return if (self.cols > 2) self.cols - 2 else 1;
     }
 
     fn msgViewportRows(self: *Tui) u16 {
-        return if (self.rows > 2) self.rows - 2 else 1;
+        const chrome = self.comp_h + 1 + self.panel_h; // composer + bar + plan panel
+        return if (self.rows > chrome) self.rows - chrome else 1;
+    }
+
+    /// Rows the plan panel gets this frame: 0 when idle, header-only on
+    /// short terminals, else header + up to 6 step rows — never squeezing
+    /// the transcript below 8 rows.
+    fn planPanelHeight(self: *Tui) u16 {
+        if (self.plan_phase == .none) return 0;
+        if (self.rows < 16) return 1; // header only
+        const chrome: usize = @as(usize, self.comp_h) + 1;
+        const max_h: usize = if (self.rows > chrome + 8) self.rows - chrome - 8 else 1;
+        const want: usize = 1 + @min(self.plan_steps.items.len, 6);
+        return @intCast(@max(@min(want, max_h), 1));
+    }
+
+    /// Recomputes the composer's wrapped rows, its on-screen height
+    /// (1..5 rows, also bounded by terminal height), and its internal
+    /// scroll so the cursor row stays visible.
+    fn layoutComposer(self: *Tui) void {
+        wrapPlain(self.gpa, &self.comp_rows, self.composer.text.items, self.compWidth());
+        const n = self.comp_rows.items.len;
+        const avail: usize = if (self.rows > 3) self.rows - 3 else 1;
+        var h = @min(n, @min(@as(usize, 5), avail));
+        if (h == 0) h = 1;
+        self.comp_h = @intCast(h);
+
+        const rc = cursorRowCol(self.comp_rows.items, self.composer.text.items, self.composer.cursor);
+        if (rc.row < self.comp_scroll) self.comp_scroll = rc.row;
+        if (rc.row >= self.comp_scroll + h) self.comp_scroll = rc.row - h + 1;
+        if (self.comp_scroll + h > n) self.comp_scroll = n - h;
+    }
+
+    /// One full frame: transcript viewport, composer, bar, cursor (or the
+    /// help overlay / too-small notice instead). Everything else funnels
+    /// through here — the frame is small (≤ terminal size), so partial
+    /// redraw bookkeeping isn't worth its bugs. Cursor is hidden during
+    /// drawing to avoid flicker.
+    pub fn renderAll(self: *Tui) void {
+        if (self.tooSmall()) {
+            self.rawWrite("\x1b[?25l\x1b[2J\x1b[1;1H");
+            self.rawWrite("terminal too small (24x6 min)");
+            return;
+        }
+        self.rawWrite("\x1b[?25l");
+        self.layoutComposer();
+        self.panel_h = self.planPanelHeight();
+        self.renderMessages();
+        self.drawPlanPanel();
+        self.drawComposer();
+        self.drawBar();
+        if (self.help_visible) {
+            self.drawHelp();
+            return; // cursor stays hidden under the overlay
+        }
+        self.positionCursor();
+    }
+
+    /// Clears and redraws from scratch (Ctrl+L — recovers from anything
+    /// that corrupted the screen outside our control).
+    pub fn redraw(self: *Tui) void {
+        self.rawWrite("\x1b[2J");
+        self.renderAll();
     }
 
     fn rowText(self: *Tui, r: Row) []const u8 {
         return self.transcript.items[r.start .. r.start + r.len];
     }
 
-    fn thinkingWidth(base: usize, is_thinking: bool) usize {
-        if (!is_thinking) return base;
-        return if (base > thinking_gutter_cols) base - thinking_gutter_cols else 1;
+    fn gutterWidth(base: usize, g: Gutter) usize {
+        if (g == .none) return base;
+        return if (base > gutter_cols) base - gutter_cols else 1;
     }
 
     /// Overwrites the currently pending tool dot's `tool_dot_len` bytes in
     /// place with `final_dot` (`tool_dot_ok`/`tool_dot_fail`) and clears
-    /// `pending_tool_dot`. Safe to call with no pending dot (no-op) — a
-    /// done-signal arriving with nothing pending shouldn't happen, but
-    /// isn't worth crashing over. `self.transcript` only ever grows via
-    /// `appendSlice`, never shifts, so a previously recorded offset stays
-    /// valid indefinitely; `rows_cache` entries reference this same byte
-    /// range by offset, not by copied text, so the very next
-    /// `renderMessages()` call picks up the patched color automatically.
+    /// `pending_tool_dot`. Safe to call with no pending dot (no-op).
+    /// `self.transcript` only ever grows via append, never shifts, so a
+    /// previously recorded offset stays valid indefinitely; `rows_cache`
+    /// entries reference this byte range by offset, so the next
+    /// `renderMessages()` picks up the patched glyph automatically.
     fn patchToolDot(self: *Tui, final_dot: []const u8) void {
         const offset = self.pending_tool_dot orelse return;
         self.pending_tool_dot = null;
@@ -240,23 +696,24 @@ pub const Tui = struct {
 
     /// Splits `line` (no embedded '\n') into physical rows of at most
     /// `self.cols` visible columns, pushing a Row per wrapped segment.
-    /// ANSI escape sequences (ESC '[' ... final-byte) count as zero width
-    /// so color codes don't eat into the column budget. `abs_start` is
-    /// `line`'s absolute offset within `self.transcript`.
+    /// ANSI escape sequences count as zero width; visible characters are
+    /// charged their Unicode display width (`charWidth`), decoded per
+    /// codepoint so multi-byte UTF-8 never splits mid-sequence. `abs_start`
+    /// is `line`'s absolute offset within `self.transcript`.
     ///
-    /// Also watches for `thinking_start_sgr`/`thinking_end_sgr` to update
-    /// `self.thinking_state` and tags each pushed Row with it, reserving
-    /// `thinking_gutter_cols` of width for thinking rows so `renderMessages`
-    /// can prepend the gutter without overflowing the terminal width.
+    /// Also watches for the thinking/error span markers to update
+    /// `self.gutter_state` and tags each pushed Row with it, reserving
+    /// `gutter_cols` of width for guttered rows so `renderMessages` can
+    /// prepend the gutter without overflowing the terminal width.
     fn wrapLogicalLine(self: *Tui, abs_start: usize, line: []const u8) void {
         const base_width: usize = if (self.cols > 0) self.cols else 80;
         if (line.len == 0) {
-            self.rows_cache.append(self.gpa, .{ .start = abs_start, .len = 0, .is_thinking = self.thinking_state }) catch {};
+            self.rows_cache.append(self.gpa, .{ .start = abs_start, .len = 0, .gutter = self.gutter_state }) catch {};
             return;
         }
         var seg_start: usize = 0;
-        var seg_is_thinking = self.thinking_state;
-        var width = thinkingWidth(base_width, seg_is_thinking);
+        var seg_gutter = self.gutter_state;
+        var width = gutterWidth(base_width, seg_gutter);
         var col: usize = 0;
         var i: usize = 0;
         while (i < line.len) {
@@ -270,54 +727,53 @@ pub const Tui = struct {
                 }
                 const seq = line[esc_start..i];
                 if (std.mem.eql(u8, seq, thinking_start_sgr)) {
-                    self.thinking_state = true;
-                } else if (std.mem.eql(u8, seq, thinking_end_sgr)) {
-                    self.thinking_state = false;
+                    self.gutter_state = .thinking;
+                } else if (std.mem.eql(u8, seq, error_start_sgr)) {
+                    self.gutter_state = .err;
+                } else if (std.mem.eql(u8, seq, span_end_sgr)) {
+                    self.gutter_state = .none;
                 } else if (std.mem.eql(u8, seq, tool_pending_sgr)) {
                     self.pending_tool_dot = abs_start + esc_start;
-                    // The bytes just written are already the bright
-                    // variant (engine.zig writes `tool_dot_pending`
-                    // unconditionally) — start `tickDots`' toggle from
-                    // "currently bright" so its first flip immediately
-                    // shows a visible change instead of a no-op re-paint
-                    // of the same bytes that happens to land on a stale
-                    // `tool_dot_blink_on` value left over from a previous
-                    // tool call.
+                    // The bytes just written are the bright variant — start
+                    // the blink toggle from "currently bright" so its first
+                    // flip shows a visible change.
                     self.tool_dot_blink_on = true;
                 } else if (std.mem.eql(u8, seq, tool_done_ok_sgr)) {
                     self.patchToolDot(tool_dot_ok);
                 } else if (std.mem.eql(u8, seq, tool_done_fail_sgr)) {
                     self.patchToolDot(tool_dot_fail);
                 }
-                // Nothing visible has been emitted into the current segment
-                // yet, so let the new state apply to it retroactively — this
-                // is what makes the common case (toggle sits at the very
-                // start of a line) reserve gutter width correctly.
+                // Nothing visible emitted into the current segment yet, so
+                // let the new state apply retroactively — this makes the
+                // common case (marker at line start) reserve gutter width
+                // correctly.
                 if (col == 0) {
-                    seg_is_thinking = self.thinking_state;
-                    width = thinkingWidth(base_width, seg_is_thinking);
+                    seg_gutter = self.gutter_state;
+                    width = gutterWidth(base_width, seg_gutter);
                 }
                 continue; // zero width, doesn't count toward col
             }
-            col += 1;
-            i += 1;
-            if (col == width) {
-                self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = i - seg_start, .is_thinking = seg_is_thinking }) catch {};
+            const d = decodeCp(line[i..]);
+            const cw: usize = charWidth(d.cp);
+            if (col + cw > width and col > 0) {
+                self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = i - seg_start, .gutter = seg_gutter }) catch {};
                 seg_start = i;
                 col = 0;
-                seg_is_thinking = self.thinking_state;
-                width = thinkingWidth(base_width, seg_is_thinking);
+                seg_gutter = self.gutter_state;
+                width = gutterWidth(base_width, seg_gutter);
             }
+            col += cw;
+            i += d.len;
         }
         if (seg_start < line.len or seg_start == 0) {
-            self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = line.len - seg_start, .is_thinking = seg_is_thinking }) catch {};
+            self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = line.len - seg_start, .gutter = seg_gutter }) catch {};
         }
     }
 
     /// Rewraps from `self.last_line_start` onward: drops cached rows
     /// belonging to the still-open last line, then re-walks just the new
-    /// tail of the transcript. Cost is proportional to newly appended bytes,
-    /// not total transcript size.
+    /// tail of the transcript. Cost is proportional to newly appended
+    /// bytes, not total transcript size.
     fn rewrapTail(self: *Tui) void {
         while (self.rows_cache.items.len > 0 and
             self.rows_cache.items[self.rows_cache.items.len - 1].start >= self.last_line_start)
@@ -337,25 +793,325 @@ pub const Tui = struct {
 
     /// Full rewrap of the entire transcript. Only needed on resize (cols
     /// changed, so every previously-cached wrap is invalid). Resets
-    /// `thinking_state` since the rescan starts from byte 0 and must derive
-    /// the state fresh rather than carry over whatever it was mid-stream.
+    /// `gutter_state` since the rescan starts from byte 0.
     fn rebuildRowsCache(self: *Tui) void {
         self.rows_cache.clearRetainingCapacity();
         self.last_line_start = 0;
-        self.thinking_state = false;
+        self.gutter_state = .none;
         self.rewrapTail();
     }
 
-    fn appendTranscript(self: *Tui, bytes: []const u8) void {
+    /// Appends locally generated bytes (the "You:" label, the round-trip
+    /// time line) straight to the transcript, stripping '\r'. Does NOT
+    /// rewrap or render — callers batch that. Streamed agent output goes
+    /// through `processStream` instead, which filters phase markers.
+    fn appendBytes(self: *Tui, bytes: []const u8) void {
         if (bytes.len == 0) return;
-        self.transcript.appendSlice(self.gpa, bytes) catch return;
-        self.rewrapTail();
-        self.renderMessages();
+        var start: usize = 0;
+        for (bytes, 0..) |b, idx| {
+            if (b == '\r') {
+                self.transcript.appendSlice(self.gpa, bytes[start..idx]) catch return;
+                start = idx + 1;
+            }
+        }
+        self.transcript.appendSlice(self.gpa, bytes[start..]) catch return;
+        self.line_start = bytes[bytes.len - 1] == '\n';
     }
 
-    /// Redraws the message viewport (rows 1..msgViewportRows) from
-    /// `rows_cache`, honoring `view_start`. Cost is O(viewport height),
-    /// independent of transcript length.
+    /// Plan-and-execute phase markers (design doc §3.5 point 4 — the
+    /// bracket-marker convention exists precisely so a stream consumer can
+    /// find phase boundaries). These lines are consumed by the plan panel
+    /// and never reach the transcript.
+    const phase_markers = [_][]const u8{
+        "[planning...]",
+        "[plan]",
+        "[/plan]",
+        "[plan unavailable, proceeding directly]",
+        "[synthesis]",
+        "[/synthesis]",
+    };
+
+    /// Could `h` (a line fragment starting with '[') still grow into a
+    /// phase marker line? Step markers carry a free-form description, so
+    /// any completion of their prefix stays a candidate until newline.
+    fn markerCandidate(h: []const u8) bool {
+        if (std.mem.startsWith(u8, h, "[step ") or std.mem.startsWith(u8, h, "[/step ")) return true;
+        if (std.mem.startsWith(u8, "[step ", h) or std.mem.startsWith(u8, "[/step ", h)) return true;
+        for (phase_markers) |p| {
+            if (h.len <= p.len) {
+                if (std.mem.startsWith(u8, p, h)) return true;
+            } else if (std.mem.startsWith(u8, h, p)) {
+                // Full marker matched but the line continues — hold until
+                // the newline proves/disproves an exact match.
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Streamed-output front door: routes bytes to the transcript (or,
+    /// inside a `[plan]` block, to `plan_buf`) while holding back any line
+    /// that may be a phase marker. Hold-back is prefix-driven, so ordinary
+    /// content — including the tool-dot marker lines, whose second byte is
+    /// ESC — flushes through after at most a byte or two of buffering; the
+    /// buffer survives across calls because markers can arrive split
+    /// across channel drains.
+    fn processStream(self: *Tui, bytes: []const u8) void {
+        for (bytes) |b| {
+            if (self.filter_line.items.len > 0) {
+                self.filter_line.append(self.gpa, b) catch {};
+                if (b == '\n') {
+                    self.classifyFilterLine();
+                } else if (self.filter_line.items.len > 512 or !markerCandidate(self.filter_line.items)) {
+                    self.flushFilterLine();
+                }
+                continue;
+            }
+            if (b == '[' and self.line_start) {
+                self.filter_line.append(self.gpa, b) catch {};
+                continue;
+            }
+            self.routeByte(b);
+        }
+    }
+
+    fn routeByte(self: *Tui, b: u8) void {
+        if (self.capturing_plan) {
+            self.plan_buf.append(self.gpa, b) catch {};
+        } else if (b != '\r') {
+            self.transcript.append(self.gpa, b) catch {};
+        }
+        self.line_start = b == '\n';
+    }
+
+    /// The held line turned out to be ordinary content — release it.
+    fn flushFilterLine(self: *Tui) void {
+        for (self.filter_line.items) |b| self.routeByte(b);
+        self.filter_line.clearRetainingCapacity();
+    }
+
+    /// A complete '['-line arrived: act on a phase marker (suppressing it
+    /// from the transcript) or flush it as content.
+    fn classifyFilterLine(self: *Tui) void {
+        const with_nl = self.filter_line.items;
+        const line = with_nl[0 .. with_nl.len - 1];
+        var handled = true;
+        if (std.mem.eql(u8, line, "[planning...]")) {
+            self.plan_phase = .planning;
+        } else if (std.mem.eql(u8, line, "[plan]")) {
+            self.capturing_plan = true;
+            self.plan_buf.clearRetainingCapacity();
+        } else if (std.mem.eql(u8, line, "[/plan]")) {
+            self.capturing_plan = false;
+            self.parsePlanBuf();
+            self.plan_phase = .executing;
+        } else if (std.mem.eql(u8, line, "[plan unavailable, proceeding directly]")) {
+            self.plan_phase = .executing;
+        } else if (std.mem.eql(u8, line, "[synthesis]")) {
+            self.plan_phase = .synthesis;
+            self.plan_current_done = true;
+        } else if (std.mem.eql(u8, line, "[/synthesis]")) {
+            // phase stays .synthesis until the turn ends
+        } else if (std.mem.startsWith(u8, line, "[step ")) {
+            handled = self.parseStepMarker(line);
+        } else if (std.mem.startsWith(u8, line, "[/step ")) {
+            self.plan_current_done = true;
+        } else {
+            handled = false;
+        }
+        if (handled) {
+            self.filter_line.clearRetainingCapacity();
+            self.line_start = true;
+        } else {
+            self.flushFilterLine();
+        }
+    }
+
+    /// `[step i/n: desc]` → current step + bar tag; in the degrade path
+    /// (no `[plan]` block was ever streamed) the description doubles as
+    /// the panel's only step row.
+    fn parseStepMarker(self: *Tui, line: []const u8) bool {
+        var i: usize = "[step ".len;
+        var a: usize = 0;
+        var b: usize = 0;
+        while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) a = a * 10 + (line[i] - '0');
+        if (i >= line.len or line[i] != '/') return false;
+        i += 1;
+        while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) b = b * 10 + (line[i] - '0');
+        if (a == 0 or b == 0) return false;
+        if (!std.mem.startsWith(u8, line[i..], ": ")) return false;
+        const desc = std.mem.trimEnd(u8, line[i + 2 ..], "]");
+        self.plan_step_i = a;
+        self.plan_step_n = b;
+        self.plan_current_done = false;
+        self.plan_phase = .executing;
+        if (self.plan_steps.items.len < a) {
+            const copy = self.gpa.dupe(u8, desc) catch return true;
+            self.plan_steps.append(self.gpa, copy) catch self.gpa.free(copy);
+        }
+        return true;
+    }
+
+    /// Parses the captured `[plan]` block ("Plan:\n1. ...\n2. ...") into
+    /// per-step descriptions.
+    fn parsePlanBuf(self: *Tui) void {
+        self.clearPlanSteps();
+        var it = std.mem.splitScalar(u8, self.plan_buf.items, '\n');
+        while (it.next()) |ln| {
+            var i: usize = 0;
+            while (i < ln.len and ln[i] >= '0' and ln[i] <= '9') : (i += 1) {}
+            if (i == 0 or i >= ln.len or ln[i] != '.') continue;
+            var j = i + 1;
+            while (j < ln.len and ln[j] == ' ') : (j += 1) {}
+            if (j >= ln.len) continue;
+            const copy = self.gpa.dupe(u8, ln[j..]) catch continue;
+            self.plan_steps.append(self.gpa, copy) catch self.gpa.free(copy);
+        }
+    }
+
+    /// Hides the panel and drops all plan state; called when a turn ends.
+    /// A still-held filter line is flushed as content first (a turn should
+    /// never end mid-marker, but bytes must not vanish if it does).
+    fn resetPlanPanel(self: *Tui) void {
+        if (self.filter_line.items.len > 0) self.flushFilterLine();
+        self.capturing_plan = false;
+        self.plan_phase = .none;
+        self.clearPlanSteps();
+        self.plan_buf.clearRetainingCapacity();
+        self.plan_current_done = false;
+        self.plan_step_i = 0;
+        self.plan_step_n = 0;
+    }
+
+    /// Truncates `text` to at most `maxw` display columns, reserving one
+    /// column for an ellipsis when it doesn't fit.
+    fn writeTruncated(self: *Tui, text: []const u8, maxw: usize) void {
+        var w: usize = 0;
+        var i: usize = 0;
+        var cut: usize = text.len;
+        var truncated = false;
+        while (i < text.len) {
+            const d = decodeCp(text[i..]);
+            const cw: usize = charWidth(d.cp);
+            if (w + cw > maxw -| 1 and cut == text.len) cut = i; // ellipsis fallback point
+            if (w + cw > maxw) {
+                truncated = true;
+                break;
+            }
+            w += cw;
+            i += d.len;
+        }
+        if (!truncated) {
+            self.rawWrite(text);
+        } else {
+            self.rawWrite(text[0..cut]);
+            self.rawWrite("\u{2026}");
+        }
+    }
+
+    /// The plan panel (between transcript and composer): an accent-guttered
+    /// block with a header row (`▍ plan 2/5`) and one row per step, glyphed
+    /// with the same status language as tool markers — ✓ done, ● running,
+    /// ○ pending. When steps outnumber the panel rows, the window follows
+    /// the current step (one completed step of context above it).
+    fn drawPlanPanel(self: *Tui) void {
+        if (self.panel_h == 0) return;
+        const first: u16 = self.rows - self.comp_h - self.panel_h;
+
+        self.writeFmt("\x1b[{d};1H", .{first});
+        self.rawWrite("\x1b[2K");
+        self.rawWrite(self.theme.accent);
+        self.rawWrite("\u{258D}");
+        self.rawWrite(self.theme.reset);
+        self.rawWrite(self.theme.dim);
+        var hdr_buf: [64]u8 = undefined;
+        const header: []const u8 = switch (self.plan_phase) {
+            .none => "",
+            .planning => "planning\u{2026}",
+            .executing => blk: {
+                if (self.plan_step_i > 0 and self.plan_step_n > 0)
+                    break :blk std.fmt.bufPrint(&hdr_buf, "plan {d}/{d}", .{ self.plan_step_i, self.plan_step_n }) catch "plan";
+                if (self.plan_steps.items.len > 0)
+                    break :blk std.fmt.bufPrint(&hdr_buf, "plan \u{B7} {d} steps", .{self.plan_steps.items.len}) catch "plan";
+                break :blk "plan \u{B7} direct";
+            },
+            .synthesis => "plan \u{B7} synthesizing\u{2026}",
+        };
+        self.rawWrite(header);
+        self.rawWrite(self.theme.reset);
+
+        const avail: usize = self.panel_h - 1;
+        const steps = self.plan_steps.items;
+        if (avail == 0) return;
+        var start: usize = 0;
+        if (steps.len > avail) {
+            const cur0: usize = if (self.plan_step_i > 0) self.plan_step_i - 1 else 0;
+            start = cur0 -| 1; // one done step of context above the current one
+            if (start > steps.len - avail) start = steps.len - avail;
+        }
+        var r: usize = 0;
+        while (r < avail) : (r += 1) {
+            const term_row = first + 1 + @as(u16, @intCast(r));
+            self.writeFmt("\x1b[{d};1H", .{term_row});
+            self.rawWrite("\x1b[2K");
+            const idx = start + r;
+            if (idx >= steps.len) continue;
+            self.rawWrite(self.theme.accent);
+            self.rawWrite("\u{258D}");
+            self.rawWrite(self.theme.reset);
+            const step_no = idx + 1;
+            const done = self.plan_phase == .synthesis or
+                step_no < self.plan_step_i or
+                (step_no == self.plan_step_i and self.plan_current_done);
+            const running = !done and step_no == self.plan_step_i;
+            if (done) {
+                self.rawWrite(self.theme.ok);
+                self.rawWrite("\u{2713} ");
+                self.rawWrite(self.theme.reset);
+            } else if (running) {
+                self.rawWrite(self.theme.warn);
+                self.rawWrite("\u{25CF} ");
+                self.rawWrite(self.theme.reset);
+            } else {
+                self.rawWrite(self.theme.dim);
+                self.rawWrite("\u{25CB} ");
+                self.rawWrite(self.theme.reset);
+            }
+            if (!running) self.rawWrite(self.theme.dim);
+            self.writeTruncated(steps[idx], @as(usize, self.cols) -| 3);
+            if (!running) self.rawWrite(self.theme.reset);
+        }
+    }
+
+    /// Writes row text to the terminal; with colors disabled, SGR/CSI
+    /// escape sequences are stripped so NO_COLOR output is genuinely plain.
+    fn writeRowFiltered(self: *Tui, text: []const u8) void {
+        if (self.theme.colors) {
+            self.rawWrite(text);
+            return;
+        }
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] == 0x1b) {
+                self.rawWrite(text[start..i]);
+                i += 1;
+                if (i < text.len and text[i] == '[') {
+                    i += 1;
+                    while (i < text.len and !(text[i] >= 0x40 and text[i] <= 0x7e)) : (i += 1) {}
+                    if (i < text.len) i += 1;
+                }
+                start = i;
+                continue;
+            }
+            i += 1;
+        }
+        self.rawWrite(text[start..]);
+    }
+
+    /// Redraws the message viewport from `rows_cache`, honoring
+    /// `view_start`. Cost is O(viewport height), independent of transcript
+    /// length.
     fn renderMessages(self: *Tui) void {
         const viewport_h = self.msgViewportRows();
         const total = self.rows_cache.items.len;
@@ -371,10 +1127,186 @@ pub const Tui = struct {
             const idx = start + row;
             if (idx < total) {
                 const r = self.rows_cache.items[idx];
-                if (r.is_thinking) self.rawWrite(thinking_gutter);
-                self.rawWrite(self.rowText(r));
+                switch (r.gutter) {
+                    .none => {},
+                    .thinking => {
+                        self.rawWrite(self.theme.accent);
+                        self.rawWrite("\u{2502}");
+                        self.rawWrite(self.theme.reset);
+                        self.rawWrite(" ");
+                    },
+                    .err => {
+                        self.rawWrite(self.theme.err_c);
+                        self.rawWrite("\u{2502}");
+                        self.rawWrite(self.theme.reset);
+                        self.rawWrite(" ");
+                    },
+                }
+                self.writeRowFiltered(self.rowText(r));
             }
         }
+    }
+
+    fn drawComposer(self: *Tui) void {
+        var r: u16 = 0;
+        while (r < self.comp_h) : (r += 1) {
+            const term_row = self.rows - self.comp_h + r;
+            self.writeFmt("\x1b[{d};1H", .{term_row});
+            self.rawWrite("\x1b[2K");
+            const idx = self.comp_scroll + r;
+            if (idx >= self.comp_rows.items.len) continue;
+            if (idx == 0) {
+                self.rawWrite(self.theme.accent);
+                self.rawWrite("\u{276F}");
+                self.rawWrite(self.theme.reset);
+                self.rawWrite(" ");
+            } else {
+                self.rawWrite("  ");
+            }
+            const vr = self.comp_rows.items[idx];
+            self.rawWrite(self.composer.text.items[vr.start .. vr.start + vr.len]);
+        }
+    }
+
+    /// The single bottom bar. Left side is contextual state, in priority
+    /// order busy > scrolled > hints; right side is persistent identity
+    /// (orchestration style with live plan progress, model, session).
+    /// Right-side pieces drop first when the terminal is narrow; hints
+    /// compress below 70 columns.
+    fn drawBar(self: *Tui) void {
+        self.writeFmt("\x1b[{d};1H", .{self.rows});
+        self.rawWrite("\x1b[2K");
+
+        var left_buf: [160]u8 = undefined;
+        var left: []const u8 = undefined;
+        var left_is_busy = false;
+        if (self.busy) {
+            left_is_busy = true;
+            if (self.cancelling) {
+                left = "\u{25CF} cancelling\u{2026}";
+            } else {
+                const dots: []const u8 = switch (self.dot_phase) {
+                    0 => ".", 1 => "..", else => "...",
+                };
+                const elapsed_s = @divTrunc(monoNs() - self.turn_start_ns, 1_000_000_000);
+                left = std.fmt.bufPrint(&left_buf, "\u{25CF} thinking{s} {d}s \u{B7} Esc cancel", .{ dots, elapsed_s }) catch "\u{25CF} thinking";
+            }
+        } else if (self.view_start != null) {
+            const viewport_h = self.msgViewportRows();
+            const total = self.rows_cache.items.len;
+            const below = total -| (self.view_start.? + viewport_h);
+            left = std.fmt.bufPrint(&left_buf, "\u{2191} {d} rows below \u{B7} PgDn newest \u{B7} Esc tail", .{below}) catch "\u{2191} scrolled";
+        } else if (self.cols >= 60) {
+            // ^P (style toggle) et al live in the ^G help overlay; keeping
+            // the hint row at 44 cols leaves room for the full right-side
+            // identity at a standard 80-col terminal.
+            left = "Enter send \u{B7} M-\u{21B5} newline \u{B7} ^G help \u{B7} ^C quit";
+        } else {
+            left = "\u{21B5} send \u{B7} ^G help";
+        }
+
+        // Right side: [style] · model · session, dropping pieces to fit.
+        var right_buf: [128]u8 = undefined;
+        var style_buf: [24]u8 = undefined;
+        const style_tag: []const u8 = if (!self.plan_execute)
+            "[react]"
+        else if (self.plan_step_n > 0)
+            std.fmt.bufPrint(&style_buf, "[plan {d}/{d}]", .{ self.plan_step_i, self.plan_step_n }) catch "[plan]"
+        else
+            "[plan]";
+
+        const left_w = displayWidth(left);
+        var right: []const u8 = "";
+        const full = std.fmt.bufPrint(&right_buf, "{s} \u{B7} {s} \u{B7} {s}", .{ style_tag, self.model_label, self.session_label }) catch style_tag;
+        if (left_w + 3 + displayWidth(full) <= self.cols) {
+            right = full;
+        } else if (left_w + 3 + displayWidth(style_tag) <= self.cols) {
+            right = style_tag;
+        }
+
+        // Left: busy state gets a colored spinner glyph, the rest is dim.
+        if (left_is_busy and self.theme.colors) {
+            // First glyph of `left` is the 3-byte "●" — color it warn/err.
+            self.rawWrite(if (self.cancelling) self.theme.err_c else self.theme.warn);
+            self.rawWrite(left[0..3]);
+            self.rawWrite(self.theme.reset);
+            self.rawWrite(self.theme.dim);
+            self.rawWrite(left[3..]);
+            self.rawWrite(self.theme.reset);
+        } else {
+            self.rawWrite(self.theme.dim);
+            self.rawWrite(left);
+            self.rawWrite(self.theme.reset);
+        }
+
+        if (right.len > 0) {
+            const col = self.cols - displayWidth(right) + 1;
+            self.writeFmt("\x1b[{d};{d}H", .{ self.rows, col });
+            self.rawWrite(self.theme.dim);
+            self.rawWrite(right);
+            self.rawWrite(self.theme.reset);
+        }
+    }
+
+    const help_title = " keys ";
+    const help_lines = [_][]const u8{
+        "Enter         send prompt",
+        "Alt+Enter     insert newline",
+        "\u{2190} \u{2192} Home End  move cursor",
+        "\u{2191} \u{2193}           move \u{B7} history at edges",
+        "Ctrl+A / E    line start / end",
+        "Ctrl+W / U    delete word / clear input",
+        "PgUp PgDn     scroll transcript (wheel too)",
+        "Esc           cancel turn \u{B7} jump tail \u{B7} clear",
+        "Ctrl+P        toggle react / plan style",
+        "Ctrl+L        redraw screen",
+        "Ctrl+Z        suspend",
+        "Ctrl+G        toggle this help",
+        "Ctrl+C / D    quit",
+    };
+
+    fn drawHelp(self: *Tui) void {
+        var inner_w: usize = displayWidth(help_title);
+        for (help_lines) |l| inner_w = @max(inner_w, displayWidth(l));
+        const box_w = inner_w + 4; // "│ " + text + " │"
+        const box_h = help_lines.len + 2;
+        if (box_w > self.cols or box_h + 2 > self.rows) return; // doesn't fit; hints still in bar
+        const top: u16 = @intCast((@as(usize, self.msgViewportRows()) -| box_h) / 2 + 1);
+        const left_col: u16 = @intCast((self.cols - box_w) / 2 + 1);
+
+        self.writeFmt("\x1b[{d};{d}H", .{ top, left_col });
+        self.rawWrite(self.theme.dim);
+        self.rawWrite("\u{256D}");
+        self.rawWrite(help_title);
+        var i: usize = displayWidth(help_title);
+        while (i < box_w - 2) : (i += 1) self.rawWrite("\u{2500}");
+        self.rawWrite("\u{256E}");
+
+        for (help_lines, 0..) |l, li| {
+            self.writeFmt("\x1b[{d};{d}H", .{ top + 1 + @as(u16, @intCast(li)), left_col });
+            self.rawWrite("\u{2502} ");
+            self.rawWrite(l);
+            var pad = inner_w - displayWidth(l);
+            while (pad > 0) : (pad -= 1) self.rawWrite(" ");
+            self.rawWrite(" \u{2502}");
+        }
+
+        self.writeFmt("\x1b[{d};{d}H", .{ top + 1 + @as(u16, @intCast(help_lines.len)), left_col });
+        self.rawWrite("\u{2570}");
+        i = 0;
+        while (i < box_w - 2) : (i += 1) self.rawWrite("\u{2500}");
+        self.rawWrite("\u{256F}");
+        self.rawWrite(self.theme.reset);
+    }
+
+    fn positionCursor(self: *Tui) void {
+        const rc = cursorRowCol(self.comp_rows.items, self.composer.text.items, self.composer.cursor);
+        const vis_row: usize = rc.row -| self.comp_scroll;
+        const term_row: usize = @as(usize, self.rows) - self.comp_h + vis_row;
+        var term_col: usize = rc.col + 3; // 1-based, after the 2-col prompt
+        if (term_col > self.cols) term_col = self.cols;
+        self.writeFmt("\x1b[{d};{d}H", .{ term_row, term_col });
+        self.rawWrite("\x1b[?25h");
     }
 
     pub const ScrollDir = enum { up, down };
@@ -391,7 +1323,7 @@ pub const Tui = struct {
 
         const new_u: usize = @intCast(new_start);
         self.view_start = if (new_u >= max_start) null else new_u;
-        self.renderMessages();
+        self.renderAll(); // bar's scroll indicator changes with the position
     }
 
     pub fn scrollLine(self: *Tui, dir: ScrollDir) void {
@@ -403,44 +1335,58 @@ pub const Tui = struct {
         self.scrollBy(if (dir == .up) page else -page);
     }
 
-    /// Sets the orchestration-style tag drawn in the status line and
-    /// redraws it immediately (see `plan_execute` field doc comment).
-    pub fn setStyle(self: *Tui, plan_execute: bool, thinking: bool) void {
+    pub fn scrolled(self: *Tui) bool {
+        return self.view_start != null;
+    }
+
+    pub fn jumpTail(self: *Tui) void {
+        self.view_start = null;
+        self.renderAll();
+    }
+
+    pub fn setStyle(self: *Tui, plan_execute: bool) void {
         self.plan_execute = plan_execute;
-        self.drawStatusLine(thinking);
-    }
-
-    fn drawStatusLine(self: *Tui, thinking: bool) void {
-        self.writeFmt("\x1b[{d};1H", .{self.rows - 1});
-        self.rawWrite("\x1b[2K");
-        self.rawWrite(if (self.plan_execute) "\x1b[2m[plan]\x1b[0m " else "\x1b[2m[react]\x1b[0m ");
-        if (thinking) {
-            const dots: []const u8 = switch (self.dot_phase) {
-                0 => ".",
-                1 => "..",
-                else => "...",
-            };
-            self.rawWrite("\x1b[2mthinking");
-            self.rawWrite(dots);
-            self.rawWrite("\x1b[0m");
+        if (!plan_execute) {
+            self.plan_step_i = 0;
+            self.plan_step_n = 0;
         }
+        self.drawBar();
+        if (!self.help_visible) self.positionCursor();
     }
 
-    fn drawInputLine(self: *Tui) void {
-        self.writeFmt("\x1b[{d};1H", .{self.rows});
-        self.rawWrite("\x1b[2K");
-        self.rawWrite("> ");
-        self.rawWrite(self.input.items);
+    /// Tracks the agent's thinking flag; redraws the bar only on a state
+    /// change so the render loop can call this every iteration for free.
+    pub fn setBusy(self: *Tui, busy: bool) void {
+        if (busy == self.busy) return;
+        self.busy = busy;
+        if (!busy) self.cancelling = false;
+        self.drawBar();
+        if (!self.help_visible) self.positionCursor();
     }
 
-    pub fn tickDots(self: *Tui, thinking: bool) bool {
+    pub fn setCancelling(self: *Tui) void {
+        self.cancelling = true;
+        self.drawBar();
+        if (!self.help_visible) self.positionCursor();
+    }
+
+    pub fn toggleHelp(self: *Tui) void {
+        self.help_visible = !self.help_visible;
+        // Underlying content may be stale under the dismissed overlay.
+        self.redraw();
+    }
+
+    /// Animation tick (~400ms, driven by the render loop's poll timeout):
+    /// advances the bar's busy spinner/elapsed counter and blinks a pending
+    /// tool dot. Returns true if anything was redrawn.
+    pub fn tickDots(self: *Tui) bool {
+        if (!self.busy and self.pending_tool_dot == null) return false;
         const now = monoNs();
         const elapsed_ms: i64 = @divTrunc(now - self.last_dot_ns, 1_000_000);
         if (elapsed_ms < 400) return false;
         self.last_dot_ns = now;
         self.dot_phase = (self.dot_phase + 1) % 3;
-        self.drawStatusLine(thinking);
-        self.drawInputLine();
+        if (self.busy) self.drawBar();
         if (self.pending_tool_dot) |offset| {
             self.tool_dot_blink_on = !self.tool_dot_blink_on;
             const dot = if (self.tool_dot_blink_on) tool_dot_pending_bright else tool_dot_pending_dim;
@@ -449,24 +1395,24 @@ pub const Tui = struct {
             }
             self.renderMessages();
         }
+        if (!self.help_visible) self.positionCursor();
         return true;
     }
 
+    /// Streamed agent output: filter phase markers / divert plan bytes,
+    /// rewrap the transcript tail, redraw.
     pub fn appendOutput(self: *Tui, bytes: []const u8) void {
-        self.appendTranscript(bytes);
-        self.drawInputLine();
-    }
-
-    pub fn onAgentStart(self: *Tui, thinking: bool) void {
-        self.last_dot_ns = monoNs();
-        self.drawStatusLine(thinking);
-        self.drawInputLine();
+        if (bytes.len == 0) return;
+        self.processStream(bytes);
+        self.rewrapTail();
+        self.renderAll();
     }
 
     /// Call once, right when a prompt is handed off to the agent, to mark
     /// the start of the round trip that `onAgentDone()` will time.
     pub fn beginTurn(self: *Tui) void {
         self.turn_start_ns = monoNs();
+        self.last_dot_ns = monoNs();
     }
 
     pub fn onAgentDone(self: *Tui) void {
@@ -474,100 +1420,219 @@ pub const Tui = struct {
         const elapsed_s = @as(f64, @floatFromInt(@max(elapsed_ns, 0))) / 1_000_000_000.0;
         var buf: [64]u8 = undefined;
         // Close the response's last (open) line, report round-trip time on
-        // its own dim line, then two blank separators before the next prompt.
+        // its own dim line, then two blank separators before the next
+        // prompt. (SGR here is stream data; NO_COLOR strips it at render.)
         const suffix = std.fmt.bufPrint(&buf, "\n\x1b[2m[{d:.1}s]\x1b[0m\n\n\n", .{elapsed_s}) catch "\n\n\n";
-        self.appendTranscript(suffix);
-        self.drawStatusLine(false);
-        self.drawInputLine();
+        self.appendBytes(suffix);
+        self.rewrapTail();
+        self.busy = false;
+        self.cancelling = false;
+        self.resetPlanPanel();
+        self.renderAll();
     }
 
-    /// Returns true if user pressed Enter with non-empty input.
+    /// Feeds one input byte through UTF-8 accumulation and the composer.
+    /// Returns true when Enter submitted non-empty input (the caller then
+    /// harvests it via `takeInput`).
     ///
     /// Callers must intercept a leading ESC (27) themselves via
-    /// `readEscapeSequence` before reaching here — see that function's doc
-    /// comment for why this can't be done statefully inside `handleKey`.
+    /// `readEscapeSequence` before reaching here.
     pub fn handleKey(self: *Tui, key: u8) bool {
+        if (self.pending_utf8_need > 0) {
+            if (key & 0xC0 == 0x80) {
+                self.pending_utf8[self.pending_utf8_len] = key;
+                self.pending_utf8_len += 1;
+                if (self.pending_utf8_len == self.pending_utf8_need) {
+                    self.composer.insert(self.gpa, self.pending_utf8[0..self.pending_utf8_len]);
+                    self.pending_utf8_need = 0;
+                    self.pending_utf8_len = 0;
+                    self.renderAll();
+                }
+                return false;
+            }
+            // Broken sequence: drop it and fall through to handle `key`.
+            self.pending_utf8_need = 0;
+            self.pending_utf8_len = 0;
+        }
         switch (key) {
             27 => return false, // stray ESC that reached us anyway: no-op
             '\r', '\n' => {
-                if (self.input.items.len == 0) return false;
-                self.transcript.appendSlice(self.gpa, "\x1b[1mYou:\x1b[0m ") catch return false;
-                self.transcript.appendSlice(self.gpa, self.input.items) catch {};
-                self.transcript.appendSlice(self.gpa, "\n\n") catch {}; // blank line before the response
+                const text = self.composer.text.items;
+                if (std.mem.indexOfNone(u8, text, " \t\n") == null) return false;
+                self.appendBytes(self.theme.bold);
+                self.appendBytes("You:");
+                self.appendBytes(self.theme.reset);
+                self.appendBytes(" ");
+                self.appendBytes(text);
+                self.appendBytes("\n\n"); // blank line before the response
                 self.rewrapTail();
                 self.view_start = null; // snap to live tail
-                self.renderMessages();
                 return true;
             },
             127, 8 => {
-                if (self.input.items.len > 0) {
-                    _ = self.input.pop();
-                    self.drawInputLine();
-                }
+                self.composer.backspace(self.gpa);
+                self.renderAll();
+                return false;
+            },
+            1 => { // Ctrl+A
+                self.composer.lineHome();
+                self.renderAll();
+                return false;
+            },
+            5 => { // Ctrl+E
+                self.composer.lineEnd();
+                self.renderAll();
+                return false;
+            },
+            23 => { // Ctrl+W
+                self.composer.deleteWordBack(self.gpa);
+                self.renderAll();
+                return false;
+            },
+            21 => { // Ctrl+U
+                self.composer.clear();
+                self.renderAll();
                 return false;
             },
             else => {
                 if (key >= 32 and key < 127) {
-                    self.input.append(self.gpa, key) catch {};
-                    self.drawInputLine();
+                    self.composer.insert(self.gpa, &[_]u8{key});
+                    self.renderAll();
+                } else if (key >= 0xC2 and key <= 0xF4) {
+                    const need = std.unicode.utf8ByteSequenceLength(key) catch return false;
+                    self.pending_utf8[0] = key;
+                    self.pending_utf8_len = 1;
+                    self.pending_utf8_need = @intCast(need);
                 }
                 return false;
             },
         }
     }
 
-    /// Returns owned copy of current input and resets the buffer.
+    pub fn insertNewline(self: *Tui) void {
+        self.composer.insert(self.gpa, "\n");
+        self.renderAll();
+    }
+
+    pub fn clearComposer(self: *Tui) void {
+        self.composer.clear();
+        self.renderAll();
+    }
+
+    pub const Move = enum { left, right, up, down, home, end, delete };
+
+    pub fn composerMove(self: *Tui, m: Move) void {
+        switch (m) {
+            .left => self.composer.moveLeft(),
+            .right => self.composer.moveRight(),
+            .home => self.composer.lineHome(),
+            .end => self.composer.lineEnd(),
+            .delete => self.composer.deleteForward(self.gpa),
+            .up, .down => {
+                // Needs fresh wrap data to know the cursor's visual row.
+                self.layoutComposer();
+                const text = self.composer.text.items;
+                const rc = cursorRowCol(self.comp_rows.items, text, self.composer.cursor);
+                if (m == .up) {
+                    if (rc.row == 0) {
+                        self.composer.historyPrev(self.gpa);
+                    } else {
+                        self.composer.cursor = byteAtCol(text, self.comp_rows.items[rc.row - 1], rc.col);
+                    }
+                } else {
+                    if (rc.row + 1 >= self.comp_rows.items.len) {
+                        self.composer.historyNext(self.gpa);
+                    } else {
+                        self.composer.cursor = byteAtCol(text, self.comp_rows.items[rc.row + 1], rc.col);
+                    }
+                }
+            },
+        }
+        self.renderAll();
+    }
+
+    pub fn pushHistory(self: *Tui, entry: []const u8) void {
+        self.composer.pushHistory(self.gpa, entry);
+    }
+
+    /// Returns an owned copy of the current input, records it in prompt
+    /// history, and resets the composer.
     pub fn takeInput(self: *Tui) []const u8 {
-        const text: []const u8 = self.gpa.dupe(u8, self.input.items) catch "";
-        self.input.clearRetainingCapacity();
-        self.drawInputLine();
+        const text: []const u8 = self.gpa.dupe(u8, self.composer.text.items) catch "";
+        self.pushHistory(text);
+        self.composer.clear();
+        self.renderAll();
         return text;
     }
 };
 
-/// What an escape sequence following a bare ESC byte turned out to mean.
-pub const EscapeResult = enum { none, up, down, page_up, page_down };
+// ─── input escape sequences ───────────────────────────────────────────────────
 
-/// Reads and classifies a CSI/SS3 escape sequence (arrow keys, Home/End,
-/// Page Up/Down, function keys, ...) that immediately follows an ESC byte
-/// already read from `fd`, so none of its bytes leak into the input field
-/// as literal characters. Uses a zero-timeout poll rather than a stateful
-/// flag carried across event-loop iterations: a lone Escape keypress has no
-/// follow-up bytes queued yet, so a blocking wait-for-next-byte approach
-/// cannot tell "standalone Escape" apart from "sequence introducer" without
-/// either misinterpreting a later, unrelated keystroke as part of the
-/// sequence or adding an artificial delay. Peeking non-blockingly resolves
-/// this immediately: if nothing is queued right after ESC, it's a standalone
-/// Escape (no-op, nothing consumed).
+/// What a byte sequence following a bare ESC turned out to mean.
+/// `.escape` is a standalone Escape keypress (nothing queued after it);
+/// `.none` is a recognized-but-unmapped sequence, fully consumed.
+pub const EscapeResult = enum {
+    none,
+    escape,
+    up,
+    down,
+    left,
+    right,
+    home,
+    end_key,
+    delete,
+    page_up,
+    page_down,
+    alt_enter,
+    wheel_up,
+    wheel_down,
+};
+
+/// Reads and classifies what follows an ESC byte already read from `fd`:
+/// CSI/SS3 sequences (arrows, Home/End, PgUp/PgDn, Delete), SGR mouse
+/// reports (wheel), kitty CSI-u Enter variants, Alt+Enter — or nothing,
+/// which means the user pressed Escape itself. Uses zero-timeout polls: a
+/// lone Escape keypress has no follow-up bytes queued, so peeking
+/// non-blockingly is the only way to tell "standalone Escape" from
+/// "sequence introducer" without artificial delays.
 pub fn readEscapeSequence(fd: posix.fd_t) EscapeResult {
     var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    if ((posix.poll(&pfd, 0) catch 0) <= 0) return .none;
+    if ((posix.poll(&pfd, 0) catch 0) <= 0) return .escape;
 
     var b: [1]u8 = undefined;
-    if (std.c.read(fd, &b, 1) <= 0) return .none;
-    if (b[0] != '[' and b[0] != 'O') return .none; // not a CSI/SS3 introducer
+    if (std.c.read(fd, &b, 1) <= 0) return .escape;
+
+    if (b[0] == '\r' or b[0] == '\n') return .alt_enter;
 
     if (b[0] == 'O') {
-        // SS3: exactly one more byte (F1-F4 etc), not used here.
-        if ((posix.poll(&pfd, 0) catch 0) > 0) _ = std.c.read(fd, &b, 1);
-        return .none;
+        // SS3: exactly one more byte (Home/End on some terminals, F1-F4).
+        if ((posix.poll(&pfd, 0) catch 0) <= 0) return .none;
+        if (std.c.read(fd, &b, 1) <= 0) return .none;
+        return switch (b[0]) {
+            'H' => .home,
+            'F' => .end_key,
+            else => .none,
+        };
     }
 
-    var param_buf: [8]u8 = undefined;
+    if (b[0] != '[') return .none; // Alt+<key>: consumed, unmapped
+
+    var param_buf: [24]u8 = undefined;
     var param_len: usize = 0;
     while ((posix.poll(&pfd, 0) catch 0) > 0) {
         if (std.c.read(fd, &b, 1) <= 0) return .none;
-        if (b[0] >= 0x40 and b[0] <= 0x7e) {
-            // Final byte: sequence done.
+        if (b[0] >= 0x40 and b[0] <= 0x7e and b[0] != '<') {
+            const params = param_buf[0..param_len];
             return switch (b[0]) {
                 'A' => .up,
                 'B' => .down,
-                '~' => if (std.mem.eql(u8, param_buf[0..param_len], "5"))
-                    .page_up
-                else if (std.mem.eql(u8, param_buf[0..param_len], "6"))
-                    .page_down
-                else
-                    .none,
+                'C' => .right,
+                'D' => .left,
+                'H' => .home,
+                'F' => .end_key,
+                '~' => classifyTilde(params),
+                'u' => classifyCsiU(params),
+                'M', 'm' => classifyMouse(params, b[0]),
                 else => .none,
             };
         }
@@ -579,6 +1644,45 @@ pub fn readEscapeSequence(fd: posix.fd_t) EscapeResult {
     return .none;
 }
 
+fn classifyTilde(params: []const u8) EscapeResult {
+    if (std.mem.eql(u8, params, "1") or std.mem.eql(u8, params, "7")) return .home;
+    if (std.mem.eql(u8, params, "4") or std.mem.eql(u8, params, "8")) return .end_key;
+    if (std.mem.eql(u8, params, "3")) return .delete;
+    if (std.mem.eql(u8, params, "5")) return .page_up;
+    if (std.mem.eql(u8, params, "6")) return .page_down;
+    return .none;
+}
+
+/// kitty CSI-u: honored if the terminal happens to send it (we never
+/// request the protocol — progressive enhancement only). Enter (13) with
+/// any modifier inserts a newline; a modified Escape (27) is still Escape.
+fn classifyCsiU(params: []const u8) EscapeResult {
+    const semi = std.mem.indexOfScalar(u8, params, ';') orelse params.len;
+    const code = std.fmt.parseInt(u32, params[0..semi], 10) catch return .none;
+    return switch (code) {
+        13 => if (semi < params.len) .alt_enter else .none,
+        27 => .escape,
+        else => .none,
+    };
+}
+
+/// SGR mouse report: `<button;x;y` + 'M' (press) / 'm' (release). Only the
+/// wheel is mapped; clicks and drags are deliberately ignored (keyboard
+/// has full parity — wheel capture is only worth it because alt-screen
+/// wheel fallback would otherwise send arrow keys into the composer).
+fn classifyMouse(params: []const u8, final: u8) EscapeResult {
+    if (params.len == 0 or params[0] != '<') return .none;
+    if (final != 'M') return .none;
+    const rest = params[1..];
+    const semi = std.mem.indexOfScalar(u8, rest, ';') orelse rest.len;
+    const btn = std.fmt.parseInt(u32, rest[0..semi], 10) catch return .none;
+    return switch (btn) {
+        64 => .wheel_up,
+        65 => .wheel_down,
+        else => .none,
+    };
+}
+
 // ─── terminal resize (SIGWINCH) ────────────────────────────────────────────────
 
 var resize_pending: std.atomic.Value(bool) = .init(false);
@@ -587,13 +1691,11 @@ var resize_wakeup_fd: posix.fd_t = -1;
 fn onSigwinch(_: posix.SIG) callconv(.c) void {
     resize_pending.store(true, .release);
     // Nudge the render loop's poll() awake immediately. Without this, a
-    // dragged/held resize fires SIGWINCH repeatedly; Zig's posix.poll retries
-    // its *entire original timeout* on EINTR (see std/posix.zig's `.INTR =>
-    // continue`), so as long as signals keep arriving faster than the
-    // timeout, poll() never actually returns — the redraw only happens once
-    // resizing pauses. Writing to the same self-pipe used for agent-channel
-    // wakeups guarantees the very next poll() call sees ready data and
-    // returns right away. write() is async-signal-safe.
+    // dragged/held resize fires SIGWINCH repeatedly; Zig's posix.poll
+    // retries its *entire original timeout* on EINTR, so as long as
+    // signals keep arriving faster than the timeout, poll() never returns
+    // — the redraw would only happen once resizing pauses. write() is
+    // async-signal-safe.
     if (resize_wakeup_fd >= 0) _ = std.c.write(resize_wakeup_fd, &[_]u8{1}, 1);
 }
 
@@ -614,14 +1716,123 @@ pub fn takeResized() bool {
     return resize_pending.swap(false, .acq_rel);
 }
 
+// ─── tests ────────────────────────────────────────────────────────────────────
+
 const testing = std.testing;
 
-test "tool-call marker: pending dot is detected and patched in place on the done-signal" {
+fn testTui() !Tui {
     const null_fd = try posix.openatZ(posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
-    defer _ = std.c.close(null_fd);
+    return Tui.init(testing.allocator, null_fd, Theme.init(true));
+}
 
-    var ui = try Tui.init(testing.allocator, null_fd);
-    defer ui.deinit();
+fn closeTui(ui: *Tui) void {
+    const fd = ui.stdout_fd;
+    ui.deinit();
+    _ = std.c.close(fd);
+}
+
+test "charWidth: ascii, CJK, emoji, combining, ZWJ" {
+    try testing.expectEqual(@as(u2, 1), charWidth('a'));
+    try testing.expectEqual(@as(u2, 2), charWidth('世'));
+    try testing.expectEqual(@as(u2, 2), charWidth(0x1F600)); // 😀
+    try testing.expectEqual(@as(u2, 0), charWidth(0x0301)); // combining acute
+    try testing.expectEqual(@as(u2, 0), charWidth(0x200D)); // ZWJ
+    try testing.expectEqual(@as(u2, 1), charWidth('\u{2502}')); // │ box drawing stays narrow
+}
+
+test "wrapPlain: wraps by display width, never splits codepoints" {
+    var rows: std.ArrayList(VRow) = .empty;
+    defer rows.deinit(testing.allocator);
+
+    // "世世世" = 3 codepoints × 2 cols; width 4 fits exactly two per row.
+    wrapPlain(testing.allocator, &rows, "世世世", 4);
+    try testing.expectEqual(@as(usize, 2), rows.items.len);
+    try testing.expectEqual(@as(usize, 6), rows.items[0].len); // two 3-byte chars
+    try testing.expectEqual(@as(usize, 6), rows.items[1].start);
+    try testing.expectEqual(@as(usize, 3), rows.items[1].len);
+
+    // newline handling + trailing empty row for cursor-after-\n
+    wrapPlain(testing.allocator, &rows, "ab\n", 80);
+    try testing.expectEqual(@as(usize, 2), rows.items.len);
+    try testing.expectEqual(@as(usize, 0), rows.items[1].len);
+}
+
+test "transcript wrap: CJK counts columns not bytes" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+    ui.cols = 10;
+
+    // 8 wide chars = 16 columns → must wrap at 5 chars (10 cols), not at
+    // 10 bytes (3⅓ chars) the old byte-counting wrap would have produced.
+    ui.appendOutput("世世世世世世世世");
+    try testing.expectEqual(@as(usize, 2), ui.rows_cache.items.len);
+    try testing.expectEqual(@as(usize, 15), ui.rows_cache.items[0].len); // 5 chars × 3 bytes
+}
+
+test "composer: utf-8 editing, cursor stays on codepoint boundaries" {
+    var c: Composer = .{};
+    defer c.deinit(testing.allocator);
+
+    c.insert(testing.allocator, "a\u{4E16}b"); // a世b
+    try testing.expectEqual(@as(usize, 5), c.cursor);
+    c.moveLeft(); // before b
+    c.moveLeft(); // before 世
+    try testing.expectEqual(@as(usize, 1), c.cursor);
+    c.deleteForward(testing.allocator); // remove 世 in one op
+    try testing.expectEqualStrings("ab", c.text.items);
+    c.insert(testing.allocator, "\u{1F600}");
+    try testing.expectEqualStrings("a\u{1F600}b", c.text.items);
+    c.backspace(testing.allocator); // removes all 4 emoji bytes
+    try testing.expectEqualStrings("ab", c.text.items);
+    try testing.expectEqual(@as(usize, 1), c.cursor);
+}
+
+test "composer: line ops and word delete" {
+    var c: Composer = .{};
+    defer c.deinit(testing.allocator);
+
+    c.insert(testing.allocator, "first line\nsecond word");
+    c.lineHome();
+    try testing.expectEqual(@as(usize, 11), c.cursor); // after the \n
+    c.lineEnd();
+    try testing.expectEqual(@as(usize, 22), c.cursor);
+    c.deleteWordBack(testing.allocator);
+    try testing.expectEqualStrings("first line\nsecond ", c.text.items);
+}
+
+test "composer: history recall round-trip preserves live text" {
+    var c: Composer = .{};
+    defer c.deinit(testing.allocator);
+
+    c.pushHistory(testing.allocator, "older");
+    c.pushHistory(testing.allocator, "newer");
+    c.insert(testing.allocator, "live");
+
+    c.historyPrev(testing.allocator);
+    try testing.expectEqualStrings("newer", c.text.items);
+    c.historyPrev(testing.allocator);
+    try testing.expectEqualStrings("older", c.text.items);
+    c.historyNext(testing.allocator);
+    try testing.expectEqualStrings("newer", c.text.items);
+    c.historyNext(testing.allocator);
+    try testing.expectEqualStrings("live", c.text.items);
+    try testing.expect(c.hist_idx == null);
+}
+
+test "cursorRowCol: wrap boundary belongs to the next row" {
+    var rows: std.ArrayList(VRow) = .empty;
+    defer rows.deinit(testing.allocator);
+    const text = "abcdef";
+    wrapPlain(testing.allocator, &rows, text, 3);
+    try testing.expectEqual(@as(usize, 2), rows.items.len);
+    const rc = cursorRowCol(rows.items, text, 3);
+    try testing.expectEqual(@as(usize, 1), rc.row);
+    try testing.expectEqual(@as(usize, 0), rc.col);
+}
+
+test "tool-call marker: pending dot is detected and patched to ✓ in place" {
+    var ui = try testTui();
+    defer closeTui(&ui);
 
     // Matches exactly what core/engine.zig writes for a tool call: the
     // pending marker (no closing newline yet — dispatch is still "running").
@@ -632,13 +1843,13 @@ test "tool-call marker: pending dot is detected and patched in place on the done
 
     // Blink tick: dot alternates to the dim variant while still pending.
     ui.last_dot_ns = 0; // force tickDots' 400ms threshold to have elapsed
-    _ = ui.tickDots(false);
+    _ = ui.tickDots();
     try testing.expect(ui.pending_tool_dot != null);
     try testing.expectEqualStrings(tool_dot_pending_dim, ui.transcript.items[offset .. offset + tool_dot_len]);
 
     // The done-signal arrives (dispatch resolved successfully) — patches
-    // the SAME bytes to green and clears pending state; the surrounding
-    // "[calculator: add 2 and 3]" text is never re-emitted or altered.
+    // the SAME bytes to the green ✓ and clears pending state; the
+    // surrounding "[calculator: ...]" text is never re-emitted or altered.
     ui.appendOutput(tool_done_ok_sgr ++ "\n");
     try testing.expect(ui.pending_tool_dot == null);
     try testing.expectEqualStrings(tool_dot_ok, ui.transcript.items[offset .. offset + tool_dot_len]);
@@ -646,6 +1857,218 @@ test "tool-call marker: pending dot is detected and patched in place on the done
 
     // A further blink tick is a no-op once nothing is pending.
     ui.last_dot_ns = 0;
-    _ = ui.tickDots(false);
+    _ = ui.tickDots();
     try testing.expectEqualStrings(tool_dot_ok, ui.transcript.items[offset .. offset + tool_dot_len]);
+}
+
+test "error span: agent error markers produce err-guttered rows" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    ui.appendOutput("before\n" ++ error_start_sgr ++ "tool failed\nbadly" ++ span_end_sgr ++ "\nafter");
+    var saw_err = false;
+    var saw_none = false;
+    for (ui.rows_cache.items) |r| {
+        switch (r.gutter) {
+            .err => saw_err = true,
+            .none => saw_none = true,
+            .thinking => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expect(saw_err);
+    try testing.expect(saw_none);
+}
+
+test "plan panel: [step i/n] markers update progress and are suppressed from the transcript" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    ui.appendOutput("\n[step 2/4: do the thing]\n");
+    try testing.expectEqual(@as(usize, 2), ui.plan_step_i);
+    try testing.expectEqual(@as(usize, 4), ui.plan_step_n);
+    try testing.expect(ui.plan_phase == .executing);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[step") == null);
+    // Degrade path: no [plan] block streamed, so the step description
+    // seeds the panel's step list.
+    try testing.expectEqual(@as(usize, 1), ui.plan_steps.items.len);
+    try testing.expectEqualStrings("do the thing", ui.plan_steps.items[0]);
+}
+
+test "plan panel: [plan] block is diverted out of the transcript and parsed into steps" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    ui.appendOutput("\n[planning...]\n");
+    try testing.expect(ui.plan_phase == .planning);
+
+    ui.appendOutput("\n[plan]\nPlan:\n1. check the cronjob\n2. describe the node\n[/plan]\n");
+    try testing.expect(ui.plan_phase == .executing);
+    try testing.expectEqual(@as(usize, 2), ui.plan_steps.items.len);
+    try testing.expectEqualStrings("check the cronjob", ui.plan_steps.items[0]);
+    try testing.expectEqualStrings("describe the node", ui.plan_steps.items[1]);
+    // None of it reached the chat view.
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "Plan:") == null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "cronjob") == null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[plan]") == null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[planning") == null);
+
+    // Step lifecycle: running → done → synthesis.
+    ui.appendOutput("\n[step 1/2: check the cronjob]\nstep output here\n[/step 1/2]\n");
+    try testing.expectEqual(@as(usize, 1), ui.plan_step_i);
+    try testing.expect(ui.plan_current_done);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "step output here") != null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[/step") == null);
+
+    ui.appendOutput("\n[synthesis]\nfinal answer\n[/synthesis]\n");
+    try testing.expect(ui.plan_phase == .synthesis);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "final answer") != null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[synthesis]") == null);
+
+    // Turn end hides the panel and drops the state.
+    ui.onAgentDone();
+    try testing.expect(ui.plan_phase == .none);
+    try testing.expectEqual(@as(usize, 0), ui.plan_steps.items.len);
+}
+
+test "plan panel: markers split across arbitrary chunk boundaries still parse" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    const stream = "\n[plan]\nPlan:\n1. alpha\n2. beta\n[/plan]\n\n[step 1/2: alpha]\nout\n";
+    // Worst case: one byte per channel drain.
+    for (stream) |b| ui.appendOutput(&[_]u8{b});
+
+    try testing.expectEqual(@as(usize, 2), ui.plan_steps.items.len);
+    try testing.expectEqualStrings("alpha", ui.plan_steps.items[0]);
+    try testing.expectEqual(@as(usize, 1), ui.plan_step_i);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "Plan:") == null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "out") != null);
+}
+
+test "plan panel: bracket lookalikes flow through to the transcript untouched" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    ui.appendOutput("[hook] calling calculator\n[cancelled]\n[plans are nice]\n[step without numbers]\n");
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[hook] calling calculator") != null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[cancelled]") != null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[plans are nice]") != null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[step without numbers]") != null);
+    try testing.expect(ui.plan_phase == .none);
+}
+
+test "frame: pinned 80x24 render carries transcript, prompt, and bar" {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    // Non-blocking read end so the drain loop below terminates.
+    const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | @as(c_int, 0o4000)); // O_NONBLOCK
+
+    var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(true));
+    defer {
+        ui.deinit();
+        _ = std.c.close(pipe_fds[1]);
+    }
+    // A pipe has no window size: init fell back to the pinned 80×24.
+    try testing.expectEqual(@as(u16, 24), ui.rows);
+    try testing.expectEqual(@as(u16, 80), ui.cols);
+
+    ui.setContext("glm-test", "default");
+    ui.composer.insert(testing.allocator, "typed");
+    ui.appendOutput("hello world\n");
+
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(testing.allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(pipe_fds[0], &buf, buf.len);
+        if (n <= 0) break;
+        try frame.appendSlice(testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try testing.expect(std.mem.indexOf(u8, frame.items, "hello world") != null);
+    // Prompt glyph and composer text (an SGR reset sits between them).
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\u{276F}") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, " typed") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "Enter send") != null); // idle hint bar
+    try testing.expect(std.mem.indexOf(u8, frame.items, "[react]") != null); // style tag
+    try testing.expect(std.mem.indexOf(u8, frame.items, "glm-test") != null); // model label
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\x1b[24;1H") != null); // bar on the last row
+}
+
+test "frame: plan panel renders above the composer with status glyphs" {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | @as(c_int, 0o4000)); // O_NONBLOCK
+
+    var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(true));
+    defer {
+        ui.deinit();
+        _ = std.c.close(pipe_fds[1]);
+    }
+
+    ui.appendOutput("\n[plan]\nPlan:\n1. first task\n2. second task\n[/plan]\n\n[step 1/2: first task]\n");
+
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(testing.allocator);
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = std.c.read(pipe_fds[0], &buf, buf.len);
+        if (n <= 0) break;
+        try frame.appendSlice(testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    // Panel sits directly above the 1-row composer at 80×24: header on row
+    // 20, steps on 21-22, composer row 23, bar row 24.
+    try testing.expect(std.mem.indexOf(u8, frame.items, "plan 1/2") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\u{258D}") != null); // panel gutter
+    // Running: warn "● " + reset, then the undimmed description.
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\u{25CF} \x1b[0mfirst task") != null);
+    // Pending: dim "○ " + reset, then the dimmed description.
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\u{25CB} \x1b[0m\x1b[2msecond task") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\x1b[20;1H") != null); // header row position
+    // The plan text never rendered inside the transcript viewport (its
+    // only occurrences are the panel rows 20-22).
+    try testing.expect(std.mem.indexOf(u8, frame.items, "Plan:") == null);
+}
+
+test "NO_COLOR: rendered output contains no SGR sequences" {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | @as(c_int, 0o4000));
+
+    var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(false));
+    defer {
+        ui.deinit();
+        _ = std.c.close(pipe_fds[1]);
+    }
+
+    // Stream data arrives with SGR in it (thinking span + colored label);
+    // the render must strip all of it.
+    ui.appendOutput("plain " ++ thinking_start_sgr ++ "thinking text" ++ span_end_sgr ++ " tail\n");
+
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(testing.allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(pipe_fds[0], &buf, buf.len);
+        if (n <= 0) break;
+        try frame.appendSlice(testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    // Cursor moves (CSI H/J/K) are fine; SGR ('m' final) must be gone.
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, frame.items, i, "\x1b[")) |p| {
+        var j = p + 2;
+        while (j < frame.items.len and !(frame.items[j] >= 0x40 and frame.items[j] <= 0x7e)) : (j += 1) {}
+        try testing.expect(j < frame.items.len);
+        try testing.expect(frame.items[j] != 'm');
+        i = j;
+    }
+    try testing.expect(std.mem.indexOf(u8, frame.items, "thinking text") != null);
 }

@@ -19,6 +19,11 @@ pub const Outcome = union(enum) {
     /// `max_retries` was exceeded; this is the human-readable failure
     /// report to surface to the UI. The context has already been pruned.
     escalated: []const u8,
+    /// The user cancelled the turn (`requestCancel`) and the engine bailed
+    /// at the next loop boundary. Whatever the turn produced up to that
+    /// point stays in memory, followed by a system note recording the
+    /// cancellation — no pruning, a cancel is not a failure (§3.4).
+    cancelled,
 };
 
 /// Orchestration style, selectable at runtime (CLI flag + TUI toggle — see
@@ -27,22 +32,25 @@ pub const Outcome = union(enum) {
 /// struct { raw: T }`, which rejects an inferred-tag enum at compile time.
 pub const Style = enum(u8) { react, plan_execute };
 
-/// Byte-length-identical (12 bytes: `ESC [ NN m` + `●` (3-byte UTF-8) +
-/// `ESC [ 0 m`) SGR-wrapped dot markers for the tool-call status line
+/// Byte-length-identical (12 bytes: `ESC [ NN m` + a 3-byte UTF-8 glyph +
+/// `ESC [ 0 m`) SGR-wrapped status markers for the tool-call line
 /// (design doc §3.6). Same length is deliberate: `tui/app.zig` locates the
 /// pending dot's bytes once (when it first sees `tool_pending_sgr`, the
 /// 5-byte color-set prefix that's also the first 5 bytes of this 12-byte
 /// unit) and later overwrites them *in place* with one of the other three
 /// — never re-emits the surrounding `[name: action]` text, so a tool call
-/// still reads as exactly one line after its dot settles to its final
-/// color. Plain yellow (not blink-attribute yellow): the TUI does the
+/// still reads as exactly one line after its dot settles. The finals are
+/// `✓`/`✗` rather than green/red dots so success and failure stay
+/// distinguishable without color (monochrome terminals, red-green CVD);
+/// both are 3-byte UTF-8 like `●`, keeping the 12-byte patch invariant.
+/// Pending is plain yellow (not blink-attribute yellow): the TUI does the
 /// actual blinking itself, by toggling these bytes on a timer (`Tui.
 /// tickDots`), rather than relying on terminal-native SGR blink support,
 /// which many terminals ignore.
 pub const tool_dot_pending = "\x1b[33m\u{25CF}\x1b[0m";
 pub const tool_dot_pending_dim = "\x1b[90m\u{25CF}\x1b[0m";
-pub const tool_dot_ok = "\x1b[32m\u{25CF}\x1b[0m";
-pub const tool_dot_fail = "\x1b[31m\u{25CF}\x1b[0m";
+pub const tool_dot_ok = "\x1b[32m\u{2713}\x1b[0m";
+pub const tool_dot_fail = "\x1b[31m\u{2717}\x1b[0m";
 /// The color-set prefix of `tool_dot_pending` — what `tui/app.zig`'s
 /// `wrapLogicalLine` actually matches against to record the dot's offset.
 const tool_pending_sgr_full = tool_dot_pending;
@@ -120,6 +128,14 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
         /// the render thread is expected to call `setStyle` on directly) —
         /// must stay atomic, same convention as `io_bus.AgentState.thinking`.
         style: std.atomic.Value(Style) = .init(.react),
+        /// Cooperative cancellation flag (§3.4), set from another thread
+        /// via `requestCancel` while a turn is running. Checked at loop
+        /// boundaries only — before each provider call, between plan
+        /// steps, and between planning attempts — never mid-HTTP-stream,
+        /// so a cancel takes effect at the next boundary rather than
+        /// instantly. Cleared at the start of every `step()` so a cancel
+        /// that lands after a turn already finished can't kill the next one.
+        cancel_requested: std.atomic.Value(bool) = .init(false),
 
         pub fn init(gpa: std.mem.Allocator, io: Io, provider: *Provider, mem: *memory.Memory) Self {
             return .{ .provider = provider, .mem = mem, .gpa = gpa, .io = io };
@@ -127,6 +143,36 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
 
         pub fn setStyle(self: *Self, s: Style) void {
             self.style.store(s, .release);
+        }
+
+        /// Asks the running turn to stop at its next loop boundary (§3.4).
+        /// Safe to call from any thread; a no-op when nothing is running
+        /// (the flag is cleared when the next turn starts).
+        pub fn requestCancel(self: *Self) void {
+            self.cancel_requested.store(true, .release);
+        }
+
+        /// True (and consumes nothing — the flag stays set so every later
+        /// boundary in the same turn also bails) when the current turn
+        /// should stop. Persists a system note the first time the caller
+        /// acts on it via `finishCancelled`.
+        fn cancelPending(self: *Self) bool {
+            return self.cancel_requested.load(.acquire);
+        }
+
+        /// Shared cancel epilogue: records the cancellation in persistent
+        /// memory (so the next turn's LLM knows the previous one was cut
+        /// short rather than silently truncated) and emits the `[cancelled]`
+        /// stream marker.
+        fn finishCancelled(self: *Self, writer: ?*Io.Writer) !Outcome {
+            try self.mem.append(Message.system(
+                "Turn cancelled by the user before completion.",
+            ));
+            if (writer) |w| {
+                try w.writeAll("\n[cancelled]\n");
+                try w.flush();
+            }
+            return .cancelled;
         }
 
         /// Static routing: dispatches to the matching tool via compile-time
@@ -178,6 +224,7 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
         /// `runToolLoop`'s `loop_arena` doesn't exist yet at turn start
         /// and is already gone by turn end.
         pub fn step(self: *Self, user_text: ?[]const u8, writer: ?*Io.Writer) !Outcome {
+            self.cancel_requested.store(false, .monotonic);
             var turn_arena = std.heap.ArenaAllocator.init(self.gpa);
             defer turn_arena.deinit();
             const ctx: hook.Ctx = .{
@@ -203,8 +250,10 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
             };
             // Paired prune-semantics invariants (§3.3): a completed turn
             // only ever grows memory; an escalated turn prunes back to at
-            // most [user_message, system_note] past the turn boundary.
-            if (outcome == .final) assert(self.mem.items().len > mem_count_turn_start);
+            // most [user_message, system_note] past the turn boundary. A
+            // cancelled turn (§3.4) grows memory too (partial work + the
+            // cancellation note stay), so the `.final` bound covers it.
+            if (outcome == .final or outcome == .cancelled) assert(self.mem.items().len > mem_count_turn_start);
             if (outcome == .escalated) assert(self.mem.items().len <= mem_count_turn_start + 2);
             // Callers own `.escalated`; if an onTurnEnd hook errors out
             // below, free it here or nobody will.
@@ -262,6 +311,10 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
 
             const maybe_plan = try self.buildPlan(scratch);
 
+            // A cancel during planning must not fall through into the
+            // single-step degrade path and execute anyway (§3.4).
+            if (self.cancelPending()) return self.finishCancelled(writer);
+
             const steps: []const plan.PlanStep = if (maybe_plan) |p| p.steps else blk: {
                 if (writer) |w| {
                     try w.writeAll("[plan unavailable, proceeding directly]\n");
@@ -318,6 +371,11 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
             try curated.append(scratch, Message.system(policy_note));
 
             for (steps, 0..) |s, i| {
+                // Between steps: bail before persisting the next step's
+                // instruction, so a cancelled turn doesn't leave a dangling
+                // never-executed instruction in memory (§3.4).
+                if (self.cancelPending()) return self.finishCancelled(writer);
+
                 if (writer) |w| {
                     try w.print("\n[step {d}/{d}: {s}]\n", .{ i + 1, steps.len, s.description });
                     try w.flush();
@@ -338,7 +396,7 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
                     try w.flush();
                 }
 
-                if (outcome == .escalated) return outcome;
+                if (outcome != .final) return outcome; // .escalated or .cancelled
 
                 // Fold this step's own reply into the curated view for the
                 // *next* step — not its raw tool-call transcript.
@@ -392,6 +450,11 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
 
             var attempt: usize = 0;
             while (attempt <= max_retries) : (attempt += 1) {
+                // A cancel lands as "no plan"; stepPlanExecute re-checks the
+                // flag right after this returns and bails before the
+                // single-step degrade path can run anything (§3.4).
+                if (self.cancelPending()) return null;
+
                 inline for (Hooks) |H| {
                     if (@hasDecl(H, "preLlm")) try H.preLlm(ctx, &ephemeral);
                 }
@@ -468,6 +531,10 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
             };
 
             while (true) {
+                // §3.4: bail before the next provider call — the one long,
+                // uninterruptible pole — never mid-stream.
+                if (self.cancelPending()) return self.finishCancelled(writer);
+
                 // Fires every iteration against the same accumulating
                 // `view` — hooks must be idempotent about what they inject
                 // (docs/feat/hooks.MD, "Documented limitations").
@@ -856,6 +923,63 @@ test "step: escalates and prunes context after max_retries malformed tool calls"
     try testing.expectEqual(@as(usize, 2), mem.items().len);
     try testing.expectEqual(message.Role.user, mem.items()[0].role);
     try testing.expectEqual(message.Role.system, mem.items()[1].role);
+}
+
+test "step: requestCancel stops the turn at the next loop boundary and records a note" {
+    // A provider wrapper that requests cancellation right after its first
+    // reply — simulating the user pressing Esc while the tool then runs.
+    const CancellingProvider = struct {
+        inner: llm.Mock,
+        flag: ?*std.atomic.Value(bool) = null,
+        pub fn chat(
+            self: *@This(),
+            gpa: std.mem.Allocator,
+            io: Io,
+            messages: []const Message,
+            tools: []const tool.Descriptor,
+            token_writer: ?*Io.Writer,
+        ) anyerror!Message {
+            const reply = try self.inner.chat(gpa, io, messages, tools, token_writer);
+            if (self.flag) |f| f.store(true, .release);
+            return reply;
+        }
+    };
+
+    var prov: CancellingProvider = .{ .inner = .{ .script = &.{
+        .{ .role = .assistant, .tool_calls = &.{
+            .{ .id = "call_1", .name = "calculator", .arguments_json = "{\"op\":\"add\",\"a\":2,\"b\":3}" },
+        } },
+        // Never reached: the loop must bail before this provider call.
+        .{ .role = .assistant, .content = "should not appear" },
+    } } };
+
+    const path = "/tmp/mymew_test_cancel.jsonl";
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var mem = try memory.Memory.init(testing.allocator, io, path);
+    defer mem.deinit();
+
+    var eng = Engine(TestTools, CancellingProvider, .{}).init(testing.allocator, io, &prov, &mem);
+    prov.flag = &eng.cancel_requested;
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    const outcome = try eng.step("what is 2 + 3?", &out.writer);
+    try testing.expect(outcome == .cancelled);
+
+    // The partial work stays (no pruning): user, assistant tool-call, tool
+    // result — then the cancellation note.
+    try testing.expectEqual(@as(usize, 4), mem.items().len);
+    try testing.expectEqual(message.Role.system, mem.items()[3].role);
+    try testing.expectEqualStrings("Turn cancelled by the user before completion.", mem.items()[3].content);
+    // The stream saw the marker, and the second scripted reply never ran.
+    const bytes = out.writer.buffer[0..out.writer.end];
+    try testing.expect(std.mem.indexOf(u8, bytes, "[cancelled]") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "should not appear") == null);
 }
 
 test "step (plan-execute): happy path executes a plan then synthesizes a final answer" {
