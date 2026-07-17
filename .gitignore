@@ -1,2 +1,3 @@
 .zig-cache/
 zig-out/
+sse_debug.log
