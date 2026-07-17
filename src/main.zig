@@ -6,6 +6,7 @@ pub const std_options: std.Options = .{
 };
 
 const agent_mod = @import("core/agent.zig");
+const engine = @import("core/engine.zig");
 const llm = @import("core/llm.zig");
 const memory = @import("core/memory.zig");
 const calculator = @import("plugins/tools/calculator.zig");
@@ -14,14 +15,34 @@ const read_file = @import("plugins/tools/read_file.zig");
 const write_file = @import("plugins/tools/write_file.zig");
 const list_files = @import("plugins/tools/list_files.zig");
 const execute_command = @import("plugins/tools/execute_command.zig");
+const tool_audit_log = @import("plugins/hooks/tool_audit_log.zig");
 const tui_mod = @import("tui/app.zig");
 
 const Tools = .{ calculator, word_count, read_file, write_file, list_files, execute_command };
-const Agent = agent_mod.Agent(Tools, llm.Glm);
+// Interceptor hooks (core/hook.zig, design doc §3.7) fire in tuple order.
+// `tool_audit_log` is the observe-only sample hook the design shipped
+// with; drop it from this tuple to silence the audit lines.
+const Hooks = .{tool_audit_log};
+const Agent = agent_mod.Agent(Tools, llm.Glm, Hooks);
+
+// `zig build test` walks the whole `@import` graph for source, but Zig
+// 0.16 only *registers* a file's `test` blocks once that file's container
+// is fully resolved — which merely calling one of its functions doesn't
+// force. Without this, `zig build test` silently reports "0 tests passed"
+// as success. One `refAllDecls` per module that has its own `test` blocks;
+// add a line here whenever a new such module is introduced.
+test {
+    std.testing.refAllDecls(@import("core/engine.zig"));
+    std.testing.refAllDecls(@import("core/plan.zig"));
+    std.testing.refAllDecls(@import("core/hook.zig"));
+    std.testing.refAllDecls(@import("plugins/hooks/tool_audit_log.zig"));
+    std.testing.refAllDecls(@import("tui/app.zig"));
+}
 
 const Cli = struct {
     prompt: ?[]const u8 = null,
     session: ?[]const u8 = null,
+    style: engine.Style = .react,
 };
 
 fn parseCli(args: std.process.Args) !Cli {
@@ -33,6 +54,15 @@ fn parseCli(args: std.process.Args) !Cli {
             cli.prompt = it.next() orelse return error.MissingPromptValue;
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--session")) {
             cli.session = it.next() orelse return error.MissingSessionValue;
+        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--style")) {
+            const v = it.next() orelse return error.MissingStyleValue;
+            if (std.mem.eql(u8, v, "react")) {
+                cli.style = .react;
+            } else if (std.mem.eql(u8, v, "plan-execute")) {
+                cli.style = .plan_execute;
+            } else {
+                return error.InvalidStyleValue;
+            }
         }
     }
     return cli;
@@ -48,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
         const stderr = std.Io.File.stderr();
         var buf: [256]u8 = undefined;
         var w = stderr.writerStreaming(io, &buf);
-        try w.interface.writeAll("Usage: mymew [-p <prompt>] [-s <session-id>]\n");
+        try w.interface.writeAll("Usage: mymew [-p <prompt>] [-s <session-id>] [-m react|plan-execute]\n");
         try w.interface.flush();
         return;
     };
@@ -74,29 +104,34 @@ pub fn main(init: std.process.Init) !void {
     defer mem.deinit();
 
     if (cli.prompt) |prompt| {
-        return runHeadless(gpa, io, &glm, &mem, prompt);
+        return runHeadless(gpa, io, &glm, &mem, prompt, cli.style);
     }
-    return runInteractive(gpa, io, &glm, &mem);
+    return runInteractive(gpa, io, &glm, &mem, cli.style);
 }
 
-/// One-shot, non-interactive turn: run the same ReAct engine as the TUI, but
+/// One-shot, non-interactive turn: run the same orchestrator as the TUI, but
 /// print streamed tokens straight to stdout and exit — no raw mode, no
 /// threads, no render loop. Lets the agent be driven as a plain CLI tool
 /// (e.g. scripted, piped) instead of only through the TUI frontend.
-fn runHeadless(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memory.Memory, prompt: []const u8) !void {
+fn runHeadless(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memory.Memory, prompt: []const u8, style: engine.Style) !void {
     var eng = Agent.EngineT.init(gpa, io, glm, mem);
+    eng.setStyle(style);
 
     const stdout = std.Io.File.stdout();
     var buf: [4096]u8 = undefined;
     var w = stdout.writerStreaming(io, &buf);
 
-    _ = eng.step(prompt, &w.interface) catch |err| {
+    if (eng.step(prompt, &w.interface)) |outcome| {
+        // `.final` was already streamed to stdout as it was generated;
+        // `.escalated`'s report string is gpa-owned and ours to free.
+        if (outcome == .escalated) gpa.free(outcome.escalated);
+    } else |err| {
         try w.interface.print("[error: {s}]\n", .{@errorName(err)});
-    };
+    }
     try w.interface.flush();
 }
 
-fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memory.Memory) !void {
+fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memory.Memory, style: engine.Style) !void {
     // Self-pipe for waking up the poll() in the render loop
     var pipe_fds: [2]posix.fd_t = undefined;
     if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
@@ -105,6 +140,7 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
 
     var agent = Agent.init(gpa, io, glm, mem, pipe_fds[1]);
     defer agent.deinit();
+    agent.eng.setStyle(style);
 
     const stdin_fd: posix.fd_t = 0;
     const stdout_fd: posix.fd_t = 1;
@@ -118,6 +154,7 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
 
     ui.enter();
     defer ui.leave();
+    ui.setStyle(style == .plan_execute, false);
 
     tui_mod.installResizeHandler(pipe_fds[1]);
 
@@ -181,7 +218,12 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
                 break;
             }
 
-            if (key == 27) {
+            if (key == 16) { // Ctrl+P: toggle orchestration style
+                const cur = agent.eng.style.load(.acquire);
+                const next: engine.Style = if (cur == .react) .plan_execute else .react;
+                agent.eng.setStyle(next);
+                ui.setStyle(next == .plan_execute, agent.state.thinking.load(.acquire));
+            } else if (key == 27) {
                 switch (tui_mod.readEscapeSequence(stdin_fd)) {
                     .up => ui.scrollLine(.up),
                     .down => ui.scrollLine(.down),
@@ -194,6 +236,7 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
                 if (submitted) {
                     const text = ui.takeInput();
                     if (text.len > 0) {
+                        ui.beginTurn();
                         ui.onAgentStart(false);
                         agent.submit(text);
                     }

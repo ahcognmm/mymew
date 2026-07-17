@@ -23,6 +23,11 @@ pub fn description() []const u8 {
     return "Write text content to a file. Creates the file if it doesn't exist. Set append=true to append instead of overwrite.";
 }
 
+pub fn describe(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
+    const verb = if (args.append orelse false) "Appending to" else "Writing to";
+    return std.fmt.allocPrint(alloc, "{s} {s}", .{ verb, args.path });
+}
+
 pub fn execute(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
     const path_z = try alloc.dupeZ(u8, args.path);
     defer alloc.free(path_z);

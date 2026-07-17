@@ -281,7 +281,11 @@ pub const Glm = struct {
                 delta.tool_calls != null,
             });
 
-            // Reasoning/thinking content (GLM chain-of-thought)
+            // Reasoning/thinking content (GLM chain-of-thought). The provider
+            // only marks the span with a dim+italic SGR toggle; the TUI is
+            // responsible for recognizing that marker and drawing whatever
+            // gutter/decoration it wants around it (see wrapLogicalLine in
+            // tui/app.zig) — presentation stays out of the provider layer.
             if (delta.reasoning_content) |rc| {
                 if (rc.len > 0) {
                     if (!in_thinking) {
@@ -301,7 +305,7 @@ pub const Glm = struct {
                 if (c.len > 0) {
                     if (in_thinking) {
                         if (token_writer) |w| {
-                            try w.writeAll("\x1b[0m\n"); // reset style, separator newline
+                            try w.writeAll("\x1b[0m\n\n"); // reset style, blank line before the response
                             try w.flush(); // flush style change immediately
                         }
                         in_thinking = false;
@@ -369,6 +373,11 @@ pub const Glm = struct {
 pub const Mock = struct {
     script: []const Message,
     next: usize = 0,
+    /// Optional: if set, records `messages.len` seen on each `chat()` call
+    /// (in call order), for tests that need to verify what context a
+    /// caller actually sent — e.g. that a curated per-step view stayed
+    /// bounded instead of growing with every prior step's raw transcript.
+    call_message_counts: ?*std.ArrayList(usize) = null,
 
     pub fn chat(
         self: *Mock,
@@ -379,9 +388,9 @@ pub const Mock = struct {
         token_writer: ?*std.Io.Writer,
     ) anyerror!Message {
         _ = io;
-        _ = messages;
         _ = tools;
         _ = token_writer;
+        if (self.call_message_counts) |counts| try counts.append(gpa, messages.len);
         if (self.next >= self.script.len) return error.MockScriptExhausted;
         const m = self.script[self.next];
         self.next += 1;

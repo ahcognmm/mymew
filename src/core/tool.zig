@@ -10,6 +10,8 @@ const std = @import("std");
 ///         pub fn name() []const u8 { return "my_tool"; }
 ///         pub fn description() []const u8 { return "Does a thing."; }
 ///         pub fn execute(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 { ... }
+///         // Optional — see `describeArgs`:
+///         pub fn describe(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 { ... }
 ///     };
 ///
 /// No vtable, no registration call: any struct exposing this shape is a
@@ -104,4 +106,32 @@ pub fn invoke(comptime Tool: type, alloc: std.mem.Allocator, args_json: []const 
         ) catch "tool execution failed" };
     };
     return .{ .ok = result };
+}
+
+/// UTF-8-boundary-safe truncation to at most `max` bytes, backing up over
+/// any partial multi-byte character at the cut point.
+fn truncateUtf8(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    while (end > 0 and (s[end] & 0xc0) == 0x80) end -= 1;
+    return s[0..end];
+}
+
+/// Produces a short, human-readable description of what a tool call is
+/// about to do, from its raw (LLM-supplied) JSON arguments — purely
+/// cosmetic (single-line TUI/log marker), never fed back to the LLM or
+/// persisted to memory (the full raw arguments already are, via the normal
+/// `.tool` message `invoke` produces). Tools may implement `describe` to
+/// customize this; tools that don't, or whose args fail to parse, or whose
+/// `describe` itself errors, get a generic fallback — the raw args JSON,
+/// truncated. Always returns an allocator-owned string the caller must
+/// free: never borrows from `args_json`, and never returns a slice into
+/// `parsed`'s own arena, which is freed before this returns.
+pub fn describeArgs(comptime Tool: type, alloc: std.mem.Allocator, args_json: []const u8) ![]const u8 {
+    if (!@hasDecl(Tool, "describe")) return alloc.dupe(u8, truncateUtf8(args_json, 80));
+    var parsed = std.json.parseFromSlice(Tool.Args, alloc, args_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return alloc.dupe(u8, truncateUtf8(args_json, 80));
+    defer parsed.deinit();
+    return Tool.describe(alloc, parsed.value) catch alloc.dupe(u8, truncateUtf8(args_json, 80));
 }

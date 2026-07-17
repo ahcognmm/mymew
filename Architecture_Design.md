@@ -13,11 +13,11 @@ The system relies on an "Engine" (The Orchestrator) that accepts a tuple of Type
 * **Static Routing:** Tool execution requests are routed using Zig's inline for unrolling. This compiles down to a static series of string comparisons, eliminating dynamic dispatch overhead.  
 * **Schema Auto-Generation:** The engine parses the Zig structs of all registered tools during initialization to automatically generate the massive JSON tool schemas required by OpenAI, Anthropic, and GLM (Zhipu).
 
-## **3\. The ReAct Orchestrator Engine**
+## **3\. Orchestration Styles**
 
-The Orchestrator is the central brain of the agent. It does not know *how* to call specific APIs; it routes a unified \[\]Message array between the IO, Memory, and LLM Provider plugins.
+The Orchestrator is the central brain of the agent. It does not know *how* to call specific APIs; it routes a unified \[\]Message array between the IO, Memory, and LLM Provider plugins. Two orchestration styles are implemented — **ReAct** (§3.1–3.3) and **Plan-and-Execute** (§3.5) — selectable at runtime via `Engine.setStyle()` (CLI flag `-m react|plan-execute`, or the TUI's Ctrl+P toggle), not baked in at compile time. Both share the same tool-dispatch/self-healing/escalation machinery (`Engine.runToolLoop`, design doc §3.2–3.3) so a bug fix or safety-net improvement to one benefits both.
 
-### **3.1. Native Function Calling**
+### **3.1. ReAct: Native Function Calling**
 
 The agent exclusively relies on native LLM function calling (tools) rather than raw prompt parsing. When the LLM provider returns a finish\_reason \== "tool\_calls", the Orchestrator intercepts it, executes the requested Zig tool, and appends the result to the context as a role: "tool" message before looping back to the LLM.
 
@@ -35,6 +35,39 @@ To prevent infinite loops and token drain if the LLM refuses to fix its syntax:
 1. **Circuit Breaker:** A MAX\_RETRIES counter (usually 3\) is strictly enforced.  
 2. **Transparent Escalation:** If the limit is hit, the engine stops talking to the LLM and sends a "Failure Report" to the UI, displaying the exact diagnostic log and broken JSON.  
 3. **Context Cleanup:** Crucially, the Orchestrator **prunes** the failed JSON payloads and error messages from the active memory array, replacing them with a single System Note: *"User was notified that the tool failed due to syntax errors."* This keeps the LLM's memory uncluttered for the next prompt.
+
+### **3.5. Plan-and-Execute**
+
+An alternative orchestration style for tasks that benefit from an upfront breakdown into steps rather than the LLM re-deciding its next move after every tool result. Implemented as `Engine.stepPlanExecute`, sharing `runToolLoop`/self-healing/escalation with ReAct rather than reimplementing them.
+
+1. **Static Planning:** A single, static plan is requested once per turn via an **ephemeral planning exchange** — a copy of the current context plus a planning-instruction system message is sent to the LLM with an empty tool list (so the LLM cannot call tools while planning) and no token streaming (raw plan JSON never reaches the visible transcript). The LLM is asked to respond with only `{"steps":[{"description":"..."}]}`. This exchange is never written to persistent memory — only the final, validated plan is.
+2. **Plan Self-Healing:** If the LLM's response isn't parseable as the expected JSON shape, the malformed response plus a corrective note are fed back into the *ephemeral* exchange (not persisted memory) for up to MAX\_RETRIES more attempts — reusing the same retry budget as tool-call self-healing.
+3. **Graceful Degrade:** If the LLM never produces a valid plan, the Orchestrator does **not** escalate — a bad plan isn't a tool failure. Instead it silently falls back to a single-step "plan" containing the user's original request verbatim, making Plan-and-Execute behave identically to ReAct in the failure case.
+4. **Delimited Streaming:** Everything streams live to the user — nothing is hidden — but each phase is wrapped in explicit `[plan]`/`[/plan]`, `[step i/n: ...]`/`[/step i/n]`, and `[synthesis]`/`[/synthesis]` markers (the same bracket-marker convention §3.6 uses for tool calls), so a reader — human or a future consumer parsing the stream — can always tell which phase a given chunk of text belongs to, rather than inferring boundaries from "until the next marker shows up."
+5. **Curated Per-Step Context — the key design point:** `runToolLoop` takes an explicit `base_view: []const Message` argument rather than always reading `self.mem.items()`. ReAct passes the full shared history (unchanged). Each plan-execute step instead gets a *curated* view: prior conversation turns, the plan, a one-time "execute automatically, no confirmation needed" policy note, and a one-line summary of each *already-completed* step — but **not** any earlier step's raw tool-call/tool-result transcript. This is deliberate: early attempts fed the full growing transcript to every step (same as ReAct), and in practice the model would pattern-match on its own prior full, chat-shaped replies far more strongly than it obeyed an instruction buried a few messages back — leading it to ask "shall I continue?", re-narrate completed work, or believe a later step was already done because an earlier step's reply looked like a finished conversation turn. Curating what a step's LLM call actually *sees* fixes this at the source rather than trying to prompt around it. Nothing is lost: `self.mem` (and the `.jsonl` transcript) still records every raw exchange for the audit log — only what's *sent to the provider* per call diverges from what's *persisted*.
+6. **Escalation:** All steps (and the planning phase) share one `turn_start` boundary, so if any step's tool calls exhaust MAX\_RETRIES, the escalation described in §3.3 prunes the **entire plan-execute turn**, plan included, back to `[user_message, system_note]` — identical semantics to a ReAct escalation. This is a deliberate v1 trade-off: a late-step failure discards earlier successful steps' work too, consistent with there being no dynamic replanning yet.
+7. **Synthesis:** Once every step completes, one more `runToolLoop` call is made — this time with `base_view = self.mem.items()`, the full raw history, since this is the one call that should legitimately see everything — with an instruction to write a single cohesive final answer from the accumulated step results, rather than surfacing the last step's output verbatim.
+
+### **3.6. Tool-Call Status Markers**
+
+Every tool call — in either orchestration style — renders as exactly **one line** in the streamed transcript: `[● name: action]`, where the dot's color reports the call's live status and `action` is a short, tool-specific, human-readable description of what's being done (e.g. `read_file` → `Reading file /etc/hosts`; `execute_command` → the command itself, verbatim). There is no separate result-preview line — full tool output is still recorded in `self.mem`/`.jsonl` for audit/synthesis, just not streamed live.
+
+* **Per-tool descriptions:** A tool may implement an optional `pub fn describe(alloc, args: Args) anyerror![]const u8` (`core/tool.zig`'s `describeArgs`, comptime-dispatched the same way `dispatch()` routes `execute` calls). Tools that don't implement it — or whose args fail to parse, or whose `describe` itself errors — fall back to a truncated dump of the raw JSON arguments. The result is always sanitized (`Engine.oneLine`) so an argument containing embedded newlines (e.g. a multi-line shell command) never breaks the one-line-per-call guarantee.
+* **In-place dot patching, not re-emitted lines:** Since a tool call is a single synchronous, blocking `execute()` and calls never overlap (`runToolLoop` dispatches one at a time even within a multi-tool-call reply), the Orchestrator writes the marker line *once*, at dispatch start, with a pending-yellow dot (`tool_dot_pending`) — then, once `dispatch()` returns, writes a tiny, invisible "done" signal (`tool_done_ok_sgr`/`tool_done_fail_sgr`, an unused/reserved SGR sub-code real terminals silently ignore if any of it ever leaks through unstripped) instead of a new line. `tui/app.zig`'s `wrapLogicalLine` — which already scans every token chunk for known SGR sequences to track the "thinking" reasoning-span gutter — recognizes `tool_pending_sgr` (the dot's 5-byte color-set prefix) and records its byte offset in the transcript buffer; on the matching done-signal, it overwrites that exact `tool_dot_len` (12-byte) span in place with the green/red variant and clears the pending offset. All four dot variants (pending-bright, pending-dim, ok, fail) are deliberately the same 12 bytes, which is what makes in-place overwriting safe without shifting or re-wrapping anything downstream.
+* **Blinking is TUI-driven, not terminal-driven:** Rather than relying on the ANSI blink SGR attribute (widely disabled/ignored by modern terminal emulators), the TUI blinks the pending dot itself: `Tui.tickDots` — the same ~400ms timer that already animates the "thinking..." status line — toggles the pending dot's bytes between the bright and dim yellow variants and triggers a redraw whenever a dot is pending.
+
+This is a from-scratch, TUI-specific mechanism, not a generic streaming-protocol change — `core/engine.zig` still only ever talks to an `Io.Writer`; `tui/app.zig` still has zero dependency on `core/*` (the dot/marker byte sequences are duplicated as matching literals in both files, same convention as `thinking_start_sgr`/`thinking_end_sgr`).
+
+### **3.7. Interceptor Hooks**
+
+A second plugin category alongside tools (full design and rationale: `docs/feat/hooks.MD`). `Engine`/`Agent` take a third comptime parameter, `Hooks` — a tuple of hook types, `.{}` for none — whose members can observe, **mutate, or veto** the main orchestration steps. Seven hook points, all optional per hook (the contract is *sparse*, §8): `onTurnStart`/`onTurnEnd` (fired once per turn in `step()`, which owns a turn-scoped scratch arena for them), `preLlm` (before every provider call, including `buildPlan`'s planning exchange; mutates the outbound *view*, never persisted memory), `postLlm` (content-only override of a reply — never `tool_calls`; not honored during planning), `preTool`/`postTool` (wrapping dispatch: `preTool` may rewrite args or veto — a veto skips dispatch, renders a red status dot, and flows back to the LLM as the tool result without counting as a self-healing retry; `postTool` may rewrite successful results but never sees self-healing diagnostics), and `onEscalate` (may replace the escalation report; the engine re-normalizes it to a gpa-owned string).
+
+Key invariants:
+
+* **Ownership:** hooks allocate replacements from `Ctx.scratch` (an engine-owned arena) and never free anything; the engine re-normalizes ownership at every boundary that assumed gpa ownership before hooks existed.
+* **Composition:** hooks fire in tuple order at every point; mutations chain; the first `preTool` veto short-circuits the rest.
+* **Dispatch:** same comptime pattern as tools — `inline for` over the tuple with `@hasDecl` checks, no vtables (§2).
+* **Curation still holds:** `preLlm` edits what the provider *sees*, not what `self.mem`/`.jsonl` records — the same view-vs-persistence split §3.5 point 5 established.
 
 ## **4\. State & Memory Management (.jsonl)**
 
@@ -76,11 +109,13 @@ diy-ai-agent/
     │   ├── engine.zig    \# The Orchestrator (Comptime registry & ReAct loop)  
     │   ├── memory.zig    \# .jsonl file handling and context window pruning  
     │   ├── llm.zig       \# API wrappers for OpenAI/GLM/Anthropic  
-    │   └── tool.zig      \# The Comptime Interface Contract documentation  
+    │   ├── tool.zig      \# The Comptime Interface Contract documentation  
+    │   └── hook.zig      \# The (sparse) Interceptor Hook Contract (§3.7, §8)  
     ├── tui/                
     │   └── app.zig       \# Layout, rendering, and Event Queue consumer  
     └── plugins/            
         ├── tools/        \# Tool implementations (calculator.zig, web\_scraper.zig)  
+        ├── hooks/        \# Interceptor hooks (tool\_audit\_log.zig)  
         └── io/           \# Alternative IO methods
 
 ## **7\. The Tool Plugin Contract**
@@ -104,3 +139,22 @@ pub const ToolContract \= struct {
         return "";  
     }  
 };  
+
+## **8\. The Hook Plugin Contract**
+
+Interceptor hooks (§3.7) satisfy a **sparse** comptime contract — unlike §7's tool contract, where every member is mandatory, only `name()` is required here. Every other method is optional and checked at its engine call site via `if (@hasDecl(H, "methodName"))`; a hook implements only the points it cares about. This sparse-contract style is deliberate and precedent-setting for this codebase: tools stay all-mandatory, hooks are opt-in per method. `core/hook.zig` is the authoritative, compiled version of this contract (it defines `Ctx` and `PreToolAction`; the `Message`/`Outcome` types below live in `core/message.zig`/`core/engine.zig` and appear only illustratively, keeping `hook.zig` dependent on nothing but `std`).
+
+pub const HookContract \= struct {
+    pub fn name() \[\]const u8 { return "example\_hook"; }
+
+    // All optional:
+    pub fn onTurnStart(ctx: Ctx, user\_text: \*?\[\]const u8) anyerror\!void
+    pub fn preLlm(ctx: Ctx, messages: \*std.ArrayList(Message)) anyerror\!void
+    pub fn postLlm(ctx: Ctx, reply: \*const Message, content\_override: \*?\[\]const u8) anyerror\!void
+    pub fn preTool(ctx: Ctx, tool\_name: \[\]const u8, args\_json: \*\[\]const u8) anyerror\!PreToolAction
+    pub fn postTool(ctx: Ctx, tool\_name: \[\]const u8, result: \*\[\]const u8) anyerror\!void
+    pub fn onEscalate(ctx: Ctx, tool\_name: \[\]const u8, diagnostic: \[\]const u8, raw\_args\_json: \[\]const u8, report: \*\[\]const u8) anyerror\!void
+    pub fn onTurnEnd(ctx: Ctx, outcome: \*const Outcome) anyerror\!void
+};
+
+Registration mirrors tools exactly: add the module to the `Hooks` tuple in `src/main.zig`, next to the `Tools` tuple. The shipped reference hook is `src/plugins/hooks/tool_audit_log.zig`, an observe-only `preTool`/`postTool` audit trail written to the live output stream. Ownership, composition order, veto semantics, per-hook-point firing sites, and documented limitations are specified in `docs/feat/hooks.MD`.

@@ -18,6 +18,10 @@ pub fn description() []const u8 {
     return "Execute a shell command and return its combined stdout and stderr output. Use for running scripts, build commands, or any shell operation.";
 }
 
+pub fn describe(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
+    return alloc.dupe(u8, args.command);
+}
+
 pub fn execute(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
     _ = args.timeout_seconds;
 

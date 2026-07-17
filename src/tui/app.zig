@@ -48,7 +48,45 @@ pub fn getTermSize(fd: posix.fd_t) struct { rows: u16, cols: u16 } {
 /// A single wrapped physical row: a byte span into `Tui.transcript`. Stored as
 /// offsets rather than slices because `transcript` is an ArrayList that can
 /// reallocate on append — slices taken before a realloc would dangle.
-const Row = struct { start: usize, len: usize };
+/// `is_thinking` marks rows that fall inside a provider-marked reasoning
+/// span (see `wrapLogicalLine`), so `renderMessages` can draw the left-hand
+/// gutter — that decoration is a TUI concern, not something the provider
+/// should embed into the byte stream itself.
+const Row = struct { start: usize, len: usize, is_thinking: bool = false };
+
+/// SGR markers a provider uses to bracket a reasoning/thinking span in the
+/// token stream (see `core/llm.zig`). The TUI watches for exactly these
+/// sequences while wrapping lines to know where to draw the thinking gutter.
+const thinking_start_sgr = "\x1b[2;3m";
+const thinking_end_sgr = "\x1b[0m";
+
+/// Left-hand gutter drawn on every physical row of a thinking span: a cyan
+/// vertical bar plus a space, so the whole span reads as one continuous rule
+/// from top to bottom. Occupies `thinking_gutter_cols` visible columns,
+/// which `wrapLogicalLine` reserves when wrapping thinking rows.
+const thinking_gutter = "\x1b[36m\u{2502}\x1b[39m ";
+const thinking_gutter_cols: usize = 2;
+
+/// Tool-call status dot markers (see `core/engine.zig` for the writer
+/// side — kept byte-for-byte in sync there; this file has no import of it,
+/// same convention as `thinking_start_sgr` above). `tool_pending_sgr` is
+/// just the 5-byte color-set prefix `wrapLogicalLine`'s escape scanner
+/// actually matches against (it only ever sees one CSI sequence at a time,
+/// not the surrounding dot character) — which is also the first 5 bytes of
+/// every `tool_dot_len`-byte dot unit below, so recording that escape's
+/// start position gives the offset of the whole dot.
+const tool_pending_sgr = "\x1b[33m";
+const tool_dot_len: usize = 12; // "\x1b[NNm" (5) + "●" (3 UTF-8 bytes) + "\x1b[0m" (4)
+const tool_dot_pending_bright = "\x1b[33m\u{25CF}\x1b[0m";
+const tool_dot_pending_dim = "\x1b[90m\u{25CF}\x1b[0m";
+const tool_dot_ok = "\x1b[32m\u{25CF}\x1b[0m";
+const tool_dot_fail = "\x1b[31m\u{25CF}\x1b[0m";
+/// Zero-width, no visible content of their own — instantaneous "patch the
+/// pending dot now" signals, not a start/end pair bracketing a span.
+/// Undefined SGR sub-codes real terminals silently ignore if any of this
+/// ever leaks through unstripped.
+const tool_done_ok_sgr = "\x1b[900m";
+const tool_done_fail_sgr = "\x1b[901m";
 
 /// Layout:
 ///   rows 1..(rows-2)  →  message viewport (owned transcript, own scrolling)
@@ -74,8 +112,38 @@ pub const Tui = struct {
     /// row index of the viewport's top; set when the user scrolls up.
     view_start: ?usize = null,
 
+    /// Whether the scan position is currently inside a provider-marked
+    /// thinking span (see `thinking_start_sgr`/`thinking_end_sgr`). Persists
+    /// across incremental `wrapLogicalLine` calls since a span can outlive
+    /// any single call as tokens stream in.
+    thinking_state: bool = false,
+
+    /// Byte offset in `self.transcript` of the currently in-flight tool
+    /// call's dot (see `tool_pending_sgr`), or null if no tool call is
+    /// pending. There is at most one at a time — tool calls run
+    /// sequentially, never concurrently, so no stack/map is needed. Set by
+    /// `wrapLogicalLine` on seeing `tool_pending_sgr`; cleared by
+    /// `patchToolDot` once the matching done-signal patches it to its
+    /// final color.
+    pending_tool_dot: ?usize = null,
+    /// Toggled each `tickDots` call while a tool is pending, to alternate
+    /// the dot between `tool_dot_pending_bright`/`_dim` — this file does
+    /// its own blink animation rather than relying on terminal-native SGR
+    /// blink support, which many terminals ignore.
+    tool_dot_blink_on: bool = false,
+
     dot_phase: u8 = 0,
     last_dot_ns: i64 = 0,
+
+    /// Monotonic timestamp captured by `beginTurn()` when the user submits a
+    /// prompt; `onAgentDone()` diffs against it to report how long the whole
+    /// round trip (submit → final response) took.
+    turn_start_ns: i64 = 0,
+
+    /// Set via `setStyle()`, read directly by `drawStatusLine`. Deliberately
+    /// a plain bool, not `core.engine.Style` — this file has no dependency
+    /// on `core/*` and shouldn't gain one just for a status-line label.
+    plan_execute: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, stdout_fd: posix.fd_t) !Tui {
         const size = getTermSize(stdout_fd);
@@ -149,18 +217,46 @@ pub const Tui = struct {
         return self.transcript.items[r.start .. r.start + r.len];
     }
 
+    fn thinkingWidth(base: usize, is_thinking: bool) usize {
+        if (!is_thinking) return base;
+        return if (base > thinking_gutter_cols) base - thinking_gutter_cols else 1;
+    }
+
+    /// Overwrites the currently pending tool dot's `tool_dot_len` bytes in
+    /// place with `final_dot` (`tool_dot_ok`/`tool_dot_fail`) and clears
+    /// `pending_tool_dot`. Safe to call with no pending dot (no-op) — a
+    /// done-signal arriving with nothing pending shouldn't happen, but
+    /// isn't worth crashing over. `self.transcript` only ever grows via
+    /// `appendSlice`, never shifts, so a previously recorded offset stays
+    /// valid indefinitely; `rows_cache` entries reference this same byte
+    /// range by offset, not by copied text, so the very next
+    /// `renderMessages()` call picks up the patched color automatically.
+    fn patchToolDot(self: *Tui, final_dot: []const u8) void {
+        const offset = self.pending_tool_dot orelse return;
+        self.pending_tool_dot = null;
+        if (offset + tool_dot_len > self.transcript.items.len) return;
+        @memcpy(self.transcript.items[offset .. offset + tool_dot_len], final_dot);
+    }
+
     /// Splits `line` (no embedded '\n') into physical rows of at most
     /// `self.cols` visible columns, pushing a Row per wrapped segment.
     /// ANSI escape sequences (ESC '[' ... final-byte) count as zero width
     /// so color codes don't eat into the column budget. `abs_start` is
     /// `line`'s absolute offset within `self.transcript`.
+    ///
+    /// Also watches for `thinking_start_sgr`/`thinking_end_sgr` to update
+    /// `self.thinking_state` and tags each pushed Row with it, reserving
+    /// `thinking_gutter_cols` of width for thinking rows so `renderMessages`
+    /// can prepend the gutter without overflowing the terminal width.
     fn wrapLogicalLine(self: *Tui, abs_start: usize, line: []const u8) void {
-        const width: usize = if (self.cols > 0) self.cols else 80;
+        const base_width: usize = if (self.cols > 0) self.cols else 80;
         if (line.len == 0) {
-            self.rows_cache.append(self.gpa, .{ .start = abs_start, .len = 0 }) catch {};
+            self.rows_cache.append(self.gpa, .{ .start = abs_start, .len = 0, .is_thinking = self.thinking_state }) catch {};
             return;
         }
         var seg_start: usize = 0;
+        var seg_is_thinking = self.thinking_state;
+        var width = thinkingWidth(base_width, seg_is_thinking);
         var col: usize = 0;
         var i: usize = 0;
         while (i < line.len) {
@@ -172,19 +268,49 @@ pub const Tui = struct {
                     while (i < line.len and !(line[i] >= 0x40 and line[i] <= 0x7e)) : (i += 1) {}
                     if (i < line.len) i += 1; // consume final byte
                 }
-                _ = esc_start;
+                const seq = line[esc_start..i];
+                if (std.mem.eql(u8, seq, thinking_start_sgr)) {
+                    self.thinking_state = true;
+                } else if (std.mem.eql(u8, seq, thinking_end_sgr)) {
+                    self.thinking_state = false;
+                } else if (std.mem.eql(u8, seq, tool_pending_sgr)) {
+                    self.pending_tool_dot = abs_start + esc_start;
+                    // The bytes just written are already the bright
+                    // variant (engine.zig writes `tool_dot_pending`
+                    // unconditionally) — start `tickDots`' toggle from
+                    // "currently bright" so its first flip immediately
+                    // shows a visible change instead of a no-op re-paint
+                    // of the same bytes that happens to land on a stale
+                    // `tool_dot_blink_on` value left over from a previous
+                    // tool call.
+                    self.tool_dot_blink_on = true;
+                } else if (std.mem.eql(u8, seq, tool_done_ok_sgr)) {
+                    self.patchToolDot(tool_dot_ok);
+                } else if (std.mem.eql(u8, seq, tool_done_fail_sgr)) {
+                    self.patchToolDot(tool_dot_fail);
+                }
+                // Nothing visible has been emitted into the current segment
+                // yet, so let the new state apply to it retroactively — this
+                // is what makes the common case (toggle sits at the very
+                // start of a line) reserve gutter width correctly.
+                if (col == 0) {
+                    seg_is_thinking = self.thinking_state;
+                    width = thinkingWidth(base_width, seg_is_thinking);
+                }
                 continue; // zero width, doesn't count toward col
             }
             col += 1;
             i += 1;
             if (col == width) {
-                self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = i - seg_start }) catch {};
+                self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = i - seg_start, .is_thinking = seg_is_thinking }) catch {};
                 seg_start = i;
                 col = 0;
+                seg_is_thinking = self.thinking_state;
+                width = thinkingWidth(base_width, seg_is_thinking);
             }
         }
         if (seg_start < line.len or seg_start == 0) {
-            self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = line.len - seg_start }) catch {};
+            self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = line.len - seg_start, .is_thinking = seg_is_thinking }) catch {};
         }
     }
 
@@ -210,10 +336,13 @@ pub const Tui = struct {
     }
 
     /// Full rewrap of the entire transcript. Only needed on resize (cols
-    /// changed, so every previously-cached wrap is invalid).
+    /// changed, so every previously-cached wrap is invalid). Resets
+    /// `thinking_state` since the rescan starts from byte 0 and must derive
+    /// the state fresh rather than carry over whatever it was mid-stream.
     fn rebuildRowsCache(self: *Tui) void {
         self.rows_cache.clearRetainingCapacity();
         self.last_line_start = 0;
+        self.thinking_state = false;
         self.rewrapTail();
     }
 
@@ -240,7 +369,11 @@ pub const Tui = struct {
             self.writeFmt("\x1b[{d};1H", .{row + 1});
             self.rawWrite("\x1b[2K");
             const idx = start + row;
-            if (idx < total) self.rawWrite(self.rowText(self.rows_cache.items[idx]));
+            if (idx < total) {
+                const r = self.rows_cache.items[idx];
+                if (r.is_thinking) self.rawWrite(thinking_gutter);
+                self.rawWrite(self.rowText(r));
+            }
         }
     }
 
@@ -270,9 +403,17 @@ pub const Tui = struct {
         self.scrollBy(if (dir == .up) page else -page);
     }
 
+    /// Sets the orchestration-style tag drawn in the status line and
+    /// redraws it immediately (see `plan_execute` field doc comment).
+    pub fn setStyle(self: *Tui, plan_execute: bool, thinking: bool) void {
+        self.plan_execute = plan_execute;
+        self.drawStatusLine(thinking);
+    }
+
     fn drawStatusLine(self: *Tui, thinking: bool) void {
         self.writeFmt("\x1b[{d};1H", .{self.rows - 1});
         self.rawWrite("\x1b[2K");
+        self.rawWrite(if (self.plan_execute) "\x1b[2m[plan]\x1b[0m " else "\x1b[2m[react]\x1b[0m ");
         if (thinking) {
             const dots: []const u8 = switch (self.dot_phase) {
                 0 => ".",
@@ -300,6 +441,14 @@ pub const Tui = struct {
         self.dot_phase = (self.dot_phase + 1) % 3;
         self.drawStatusLine(thinking);
         self.drawInputLine();
+        if (self.pending_tool_dot) |offset| {
+            self.tool_dot_blink_on = !self.tool_dot_blink_on;
+            const dot = if (self.tool_dot_blink_on) tool_dot_pending_bright else tool_dot_pending_dim;
+            if (offset + tool_dot_len <= self.transcript.items.len) {
+                @memcpy(self.transcript.items[offset .. offset + tool_dot_len], dot);
+            }
+            self.renderMessages();
+        }
         return true;
     }
 
@@ -314,8 +463,20 @@ pub const Tui = struct {
         self.drawInputLine();
     }
 
+    /// Call once, right when a prompt is handed off to the agent, to mark
+    /// the start of the round trip that `onAgentDone()` will time.
+    pub fn beginTurn(self: *Tui) void {
+        self.turn_start_ns = monoNs();
+    }
+
     pub fn onAgentDone(self: *Tui) void {
-        self.appendTranscript("\n\n"); // close the last line + one blank separator
+        const elapsed_ns = monoNs() - self.turn_start_ns;
+        const elapsed_s = @as(f64, @floatFromInt(@max(elapsed_ns, 0))) / 1_000_000_000.0;
+        var buf: [64]u8 = undefined;
+        // Close the response's last (open) line, report round-trip time on
+        // its own dim line, then two blank separators before the next prompt.
+        const suffix = std.fmt.bufPrint(&buf, "\n\x1b[2m[{d:.1}s]\x1b[0m\n\n\n", .{elapsed_s}) catch "\n\n\n";
+        self.appendTranscript(suffix);
         self.drawStatusLine(false);
         self.drawInputLine();
     }
@@ -332,7 +493,7 @@ pub const Tui = struct {
                 if (self.input.items.len == 0) return false;
                 self.transcript.appendSlice(self.gpa, "\x1b[1mYou:\x1b[0m ") catch return false;
                 self.transcript.appendSlice(self.gpa, self.input.items) catch {};
-                self.transcript.append(self.gpa, '\n') catch {};
+                self.transcript.appendSlice(self.gpa, "\n\n") catch {}; // blank line before the response
                 self.rewrapTail();
                 self.view_start = null; // snap to live tail
                 self.renderMessages();
@@ -451,4 +612,40 @@ pub fn installResizeHandler(wakeup_fd: posix.fd_t) void {
 /// Returns true (once) if a resize was signaled since the last call.
 pub fn takeResized() bool {
     return resize_pending.swap(false, .acq_rel);
+}
+
+const testing = std.testing;
+
+test "tool-call marker: pending dot is detected and patched in place on the done-signal" {
+    const null_fd = try posix.openatZ(posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+    defer _ = std.c.close(null_fd);
+
+    var ui = try Tui.init(testing.allocator, null_fd);
+    defer ui.deinit();
+
+    // Matches exactly what core/engine.zig writes for a tool call: the
+    // pending marker (no closing newline yet — dispatch is still "running").
+    ui.appendOutput("\n[" ++ tool_dot_pending_bright ++ " calculator: add 2 and 3]");
+    try testing.expect(ui.pending_tool_dot != null);
+    const offset = ui.pending_tool_dot.?;
+    try testing.expectEqualStrings(tool_dot_pending_bright, ui.transcript.items[offset .. offset + tool_dot_len]);
+
+    // Blink tick: dot alternates to the dim variant while still pending.
+    ui.last_dot_ns = 0; // force tickDots' 400ms threshold to have elapsed
+    _ = ui.tickDots(false);
+    try testing.expect(ui.pending_tool_dot != null);
+    try testing.expectEqualStrings(tool_dot_pending_dim, ui.transcript.items[offset .. offset + tool_dot_len]);
+
+    // The done-signal arrives (dispatch resolved successfully) — patches
+    // the SAME bytes to green and clears pending state; the surrounding
+    // "[calculator: add 2 and 3]" text is never re-emitted or altered.
+    ui.appendOutput(tool_done_ok_sgr ++ "\n");
+    try testing.expect(ui.pending_tool_dot == null);
+    try testing.expectEqualStrings(tool_dot_ok, ui.transcript.items[offset .. offset + tool_dot_len]);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "calculator: add 2 and 3") != null);
+
+    // A further blink tick is a no-op once nothing is pending.
+    ui.last_dot_ns = 0;
+    _ = ui.tickDots(false);
+    try testing.expectEqualStrings(tool_dot_ok, ui.transcript.items[offset .. offset + tool_dot_len]);
 }

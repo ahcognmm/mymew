@@ -15,6 +15,10 @@ pub fn description() []const u8 {
     return "Read and return the full text contents of a file at the given path.";
 }
 
+pub fn describe(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
+    return std.fmt.allocPrint(alloc, "Reading file {s}", .{args.path});
+}
+
 pub fn execute(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
     const path_z = try alloc.dupeZ(u8, args.path);
     defer alloc.free(path_z);

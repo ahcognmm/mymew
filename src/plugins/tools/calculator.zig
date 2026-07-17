@@ -16,6 +16,10 @@ pub fn description() []const u8 {
     return "Performs a basic arithmetic operation (add, sub, mul, div) on two numbers.";
 }
 
+pub fn describe(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
+    return std.fmt.allocPrint(alloc, "{s} {d} and {d}", .{ @tagName(args.op), args.a, args.b });
+}
+
 pub fn execute(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
     const result: f64 = switch (args.op) {
         .add => args.a + args.b,

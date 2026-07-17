@@ -10,10 +10,14 @@ const io_bus = @import("io_bus.zig");
 ///
 /// The render thread talks to this through `state`/`channel`: it calls
 /// `submit()` to hand off a prompt and drains `channel` for streamed tokens.
-pub fn Agent(comptime Tools: anytype, comptime Provider: type) type {
+///
+/// `Hooks` is forwarded to the inner `Engine` untouched (never hardcoded
+/// to `.{}` here) so the TUI path can register interceptor hooks — see
+/// `core/hook.zig` and design doc §3.7.
+pub fn Agent(comptime Tools: anytype, comptime Provider: type, comptime Hooks: anytype) type {
     return struct {
         const Self = @This();
-        pub const EngineT = engine.Engine(Tools, Provider);
+        pub const EngineT = engine.Engine(Tools, Provider, Hooks);
 
         gpa: std.mem.Allocator,
         io: Io,
@@ -92,11 +96,16 @@ pub fn Agent(comptime Tools: anytype, comptime Provider: type) type {
                 // Send a wakeup so the render loop picks up thinking=true immediately
                 _ = std.c.write(self.wakeup_write, &[_]u8{1}, 1);
 
-                _ = self.eng.step(text, token_writer) catch |err| {
+                if (self.eng.step(text, token_writer)) |outcome| {
+                    // `.final` was already streamed via `token_writer` as it
+                    // was generated; `.escalated`'s report string is
+                    // gpa-owned and ours to free (see `Engine.Outcome`).
+                    if (outcome == .escalated) self.gpa.free(outcome.escalated);
+                } else |err| {
                     const msg = std.fmt.allocPrint(self.gpa, "\r\n[error: {s}]\r\n", .{@errorName(err)}) catch "";
                     self.channel.push(io, msg) catch {};
                     self.gpa.free(msg);
-                };
+                }
 
                 if (text.len > 0) self.gpa.free(text);
                 self.state.thinking.store(false, .release);

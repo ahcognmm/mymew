@@ -17,6 +17,10 @@ pub fn description() []const u8 {
     return "List files and directories at the given path. Returns names, sizes, and types.";
 }
 
+pub fn describe(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
+    return std.fmt.allocPrint(alloc, "Listing files in {s}", .{args.path});
+}
+
 pub fn execute(alloc: std.mem.Allocator, args: Args) anyerror![]const u8 {
     const cmd_str = try std.fmt.allocPrint(alloc, "ls -la -- {s} 2>&1", .{args.path});
     defer alloc.free(cmd_str);
