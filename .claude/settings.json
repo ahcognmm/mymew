@@ -1,5 +1,6 @@
 {
   "enabledPlugins": {
-    "tiger-style@tiger-style": true
+    "tiger-style@tiger-style": true,
+    "terminal@gfargo-skills": true
   }
 }

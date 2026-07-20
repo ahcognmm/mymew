@@ -290,7 +290,7 @@ pub const Glm = struct {
                 if (rc.len > 0) {
                     if (!in_thinking) {
                         if (token_writer) |w| {
-                            try w.writeAll("\x1b[2;3m"); // dim + italic for thinking
+                            try w.writeAll("\x1b[2;3;36m"); // dim + italic + cyan for thinking — italic alone is invisible on many terminals
                             try w.flush(); // flush style change immediately
                         }
                         in_thinking = true;

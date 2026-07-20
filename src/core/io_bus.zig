@@ -105,4 +105,14 @@ pub const AgentState = struct {
 
     thinking: std.atomic.Value(bool) = .init(false),
     agent_finished: std.atomic.Value(bool) = .init(false),
+
+    /// Human-in-the-loop approval handoff (design doc §3.9). The agent
+    /// thread parks a question here and blocks on `cond` until the frontend
+    /// answers; the question slice is borrowed from the blocked caller, so
+    /// it stays valid exactly while `approval_question != null`. Guarded by
+    /// `mutex`; `approval_pending` is the lock-free "is there something to
+    /// show?" flag the frontend polls each frame.
+    approval_question: ?[]const u8 = null,
+    approval_answer: ?bool = null,
+    approval_pending: std.atomic.Value(bool) = .init(false),
 };

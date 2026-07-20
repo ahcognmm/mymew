@@ -9,7 +9,7 @@ const io_bus = @import("io_bus.zig");
 /// escalation reports and turn-level errors. Dim red is both a sane visible
 /// fallback for a plain consumer of the stream AND the sequence
 /// `tui/app.zig` recognizes to draw its red error gutter (same convention
-/// as `llm.zig`'s `\x1b[2;3m` thinking markers; the literals are duplicated
+/// as `llm.zig`'s `\x1b[2;3;36m` thinking markers; the literals are duplicated
 /// there, never imported, to keep `app.zig` free of `core/*`).
 const error_start_sgr = "\x1b[2;31m";
 const error_end_sgr = "\x1b[0m";
@@ -57,10 +57,74 @@ pub fn Agent(comptime Tools: anytype, comptime Provider: type, comptime Hooks: a
         }
 
         /// Spawns the background loop and detaches it; call `requestStop()`
-        /// to signal shutdown before the process exits.
+        /// to signal shutdown before the process exits. Also registers this
+        /// agent as the engine's human-in-the-loop approver (design doc
+        /// §3.9) — `self` must be at its final address by now, which spawn
+        /// (unlike init) can rely on.
         pub fn spawn(self: *Self) !void {
+            self.eng.setApprover(.{ .ptr = self, .requestFn = approverRequest });
             const thread = try std.Thread.spawn(.{}, run, .{self});
             thread.detach();
+        }
+
+        /// Blocking approval request, called on the orchestrator thread via
+        /// the `hook.Approver` bridge: parks the question in `state`, pings
+        /// the wakeup fd so the render loop notices immediately, then waits
+        /// until the frontend answers or the turn is cancelled (§3.4 —
+        /// cancel counts as a deny, so the engine can reach its next cancel
+        /// checkpoint instead of dangling here forever).
+        fn requestApproval(self: *Self, question: []const u8) bool {
+            const io = self.io;
+            self.state.mutex.lockUncancelable(io);
+            self.state.approval_question = question;
+            self.state.approval_answer = null;
+            self.state.mutex.unlock(io);
+            self.state.approval_pending.store(true, .release);
+            _ = std.c.write(self.wakeup_write, &[_]u8{1}, 1);
+
+            self.state.mutex.lockUncancelable(io);
+            while (self.state.approval_answer == null and
+                !self.eng.cancel_requested.load(.acquire))
+            {
+                self.state.cond.waitUncancelable(io, &self.state.mutex);
+            }
+            const answer = self.state.approval_answer orelse false;
+            self.state.approval_question = null;
+            self.state.approval_answer = null;
+            self.state.mutex.unlock(io);
+            self.state.approval_pending.store(false, .release);
+            _ = std.c.write(self.wakeup_write, &[_]u8{1}, 1);
+            return answer;
+        }
+
+        fn approverRequest(ptr: *anyopaque, question: []const u8) bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.requestApproval(question);
+        }
+
+        /// Frontend poll: true while the orchestrator thread is blocked in
+        /// `requestApproval` waiting for a yes/no.
+        pub fn approvalPending(self: *Self) bool {
+            return self.state.approval_pending.load(.acquire);
+        }
+
+        /// Frontend: gpa-owned copy of the pending question (caller frees),
+        /// or null if the request already resolved between the poll and
+        /// this call.
+        pub fn copyApprovalQuestion(self: *Self, gpa: std.mem.Allocator) ?[]u8 {
+            self.state.mutex.lockUncancelable(self.io);
+            defer self.state.mutex.unlock(self.io);
+            const q = self.state.approval_question orelse return null;
+            return gpa.dupe(u8, q) catch null;
+        }
+
+        /// Frontend: answers the pending approval (no-op if none) and wakes
+        /// the blocked orchestrator thread.
+        pub fn answerApproval(self: *Self, approved: bool) void {
+            self.state.mutex.lockUncancelable(self.io);
+            if (self.state.approval_question != null) self.state.approval_answer = approved;
+            self.state.mutex.unlock(self.io);
+            self.state.cond.signal(self.io);
         }
 
         /// Hands a user prompt to the background loop. `text` must be an
@@ -82,9 +146,11 @@ pub fn Agent(comptime Tools: anytype, comptime Provider: type, comptime Hooks: a
         /// Asks the currently running turn (if any) to stop at its next
         /// loop boundary (design doc §3.4). Thread-safe — meant to be
         /// called directly from the render thread, same convention as
-        /// `eng.setStyle`.
+        /// `eng.setStyle`. Also wakes a `requestApproval` wait, which
+        /// treats the cancel as a deny (§3.9).
         pub fn requestCancel(self: *Self) void {
             self.eng.requestCancel();
+            self.state.cond.signal(self.io);
         }
 
         fn run(self: *Self) void {

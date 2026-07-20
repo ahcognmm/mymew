@@ -52,6 +52,28 @@ pub const Style = enum(u8) { react, todo };
 /// `onTurnEnd` is observe-only by design — `Outcome`'s payloads have two
 /// different owners (memory arena vs. caller-freed gpa), so an override
 /// there would dangle or double-free.
+/// Blocking human-in-the-loop approval bridge (design doc §3.9). A frontend
+/// that can ask the user a yes/no question registers one on the engine
+/// (`Engine.setApprover`); hooks reach it through `Ctx.approver`. Type-erased
+/// (`*anyopaque` + function pointer) rather than comptime-parameterized so
+/// this file keeps depending on nothing but `std` and hooks stay plain
+/// static modules.
+///
+/// `request` BLOCKS the orchestrator thread until the user answers (or the
+/// turn is cancelled — implementations must treat a §3.4 cancel as a deny
+/// and return, never dangle). Absent approver (`Ctx.approver == null`, e.g.
+/// the headless path) means "nobody can approve": a policy hook should fail
+/// closed (veto), not open.
+pub const Approver = struct {
+    ptr: *anyopaque,
+    requestFn: *const fn (ptr: *anyopaque, question: []const u8) bool,
+
+    /// True = user approved. `question` only needs to live for the call.
+    pub fn request(self: Approver, question: []const u8) bool {
+        return self.requestFn(self.ptr, question);
+    }
+};
+
 pub const Ctx = struct {
     /// The engine's general-purpose allocator. Hooks normally have no
     /// business allocating from it — replacement strings come from
@@ -72,6 +94,10 @@ pub const Ctx = struct {
     /// literal call sites (as of this field's introduction) keep compiling
     /// unchanged.
     style: Style = .react,
+    /// Human-in-the-loop bridge (see `Approver` above); null when no
+    /// frontend capable of asking is attached (headless), in which case
+    /// policy hooks fail closed.
+    approver: ?Approver = null,
 };
 
 /// What `preTool` tells the engine to do with a pending tool call.

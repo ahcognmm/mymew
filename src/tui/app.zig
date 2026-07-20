@@ -93,6 +93,10 @@ pub const Theme = struct {
     err_c: []const u8, // red — error gutter
     warn: []const u8, // yellow — busy spinner, in_progress todo item
     ok: []const u8, // green — completed todo item
+    code_bar: []const u8, // magenta — code-block gutter, distinct from accent/err/warn/ok
+    code_bg: []const u8, // 256-color dark-gray tint painted behind fenced code rows
+    inline_code: []const u8, // bold accent used for `inline code` spans within a row
+    fg_reset: []const u8, // drops foreground to terminal default without touching an active bg
 
     pub fn init(colors: bool) Theme {
         if (!colors) return .{
@@ -104,6 +108,10 @@ pub const Theme = struct {
             .err_c = "",
             .warn = "",
             .ok = "",
+            .code_bar = "",
+            .code_bg = "",
+            .inline_code = "",
+            .fg_reset = "",
         };
         return .{
             .colors = true,
@@ -114,6 +122,10 @@ pub const Theme = struct {
             .err_c = "\x1b[31m",
             .warn = "\x1b[33m",
             .ok = "\x1b[32m",
+            .code_bar = "\x1b[35m",
+            .code_bg = "\x1b[48;5;236m",
+            .inline_code = "\x1b[1;36m",
+            .fg_reset = "\x1b[39m",
         };
     }
 };
@@ -170,6 +182,22 @@ pub fn charWidth(cp: u21) u2 {
 }
 
 /// Sum of `charWidth` over `text` (no escape sequences expected).
+/// Longest prefix of `text` fitting in `max_cols` display columns, cut at a
+/// codepoint boundary (never mid-UTF-8). Used by the bar's approval prompt
+/// to truncate the question without breaking the row.
+pub fn truncateCols(text: []const u8, max_cols: usize) []const u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const d = decodeCp(text[i..]);
+        const cw = charWidth(d.cp);
+        if (w + cw > max_cols) break;
+        w += cw;
+        i += d.len;
+    }
+    return text[0..i];
+}
+
 pub fn displayWidth(text: []const u8) usize {
     var w: usize = 0;
     var i: usize = 0;
@@ -186,7 +214,7 @@ pub fn displayWidth(text: []const u8) usize {
 /// SGR markers a provider uses to bracket a reasoning/thinking span in the
 /// token stream (see `core/llm.zig`). The TUI watches for exactly these
 /// sequences while wrapping lines to know where to draw the thinking gutter.
-const thinking_start_sgr = "\x1b[2;3m";
+const thinking_start_sgr = "\x1b[2;3;36m";
 /// SGR markers `core/agent.zig` uses to bracket an error/diagnostic span
 /// (escalation reports, `[error: ...]` lines) — dim red as a plain-stream
 /// fallback, red gutter here.
@@ -215,8 +243,11 @@ const tool_done_fail_sgr = "\x1b[901m";
 
 /// Which left-hand gutter a transcript row renders with. `.thinking` spans
 /// come from the provider's reasoning markers; `.err` spans from
-/// `core/agent.zig`'s escalation/error markers.
-pub const Gutter = enum { none, thinking, err };
+/// `core/agent.zig`'s escalation/error markers; `.code` spans from a
+/// plain-text ``` fence in the assistant's own reply — unlike the other two,
+/// there is no wire SGR marker for it, `wrapLogicalLine` detects the fence
+/// bytes directly, since fenced code is just markdown the model wrote.
+pub const Gutter = enum { none, thinking, err, code };
 
 /// A single wrapped physical row: a byte span into `Tui.transcript`. Stored
 /// as offsets rather than slices because `transcript` is an ArrayList that
@@ -451,6 +482,14 @@ pub const Tui = struct {
     /// single call as tokens stream in.
     gutter_state: Gutter = .none,
 
+    /// Whether the scan position is currently inside a ```-fenced code
+    /// block. Tracked separately from `gutter_state` (rather than as
+    /// another value fed through the same field) because it's detected
+    /// from plain fence bytes the model wrote, not a wire SGR marker, and
+    /// must survive across the many `wrapLogicalLine` calls one streamed
+    /// block spans.
+    in_code: bool = false,
+
     /// Byte offset in `self.transcript` of the currently in-flight tool
     /// call's dot (see `tool_pending_sgr`), or null if no tool call is
     /// pending. At most one at a time — tool calls run sequentially.
@@ -474,6 +513,12 @@ pub const Tui = struct {
     busy: bool = false,
     cancelling: bool = false,
     help_visible: bool = false,
+    /// Pending human-approval question (gpa-owned copy, set via
+    /// `setApproval`), or null. While non-null the bar's left side becomes
+    /// the approval prompt (top priority) and the main loop routes y/n keys
+    /// to the agent instead of the composer. Plain string, not a `core/*`
+    /// type — same no-core-dependency rule as every other field here.
+    approval_text: ?[]u8 = null,
     /// Whether the next streamed byte starts a line (also drives marker
     /// detection in `processStream`).
     line_start: bool = true,
@@ -536,6 +581,7 @@ pub const Tui = struct {
     }
 
     pub fn deinit(self: *Tui) void {
+        if (self.approval_text) |q| self.gpa.free(q);
         self.transcript.deinit(self.gpa);
         self.rows_cache.deinit(self.gpa);
         self.composer.deinit(self.gpa);
@@ -681,6 +727,16 @@ pub const Tui = struct {
         return if (base > gutter_cols) base - gutter_cols else 1;
     }
 
+    /// The gutter the row being scanned right now should carry: a
+    /// wire-marked thinking/error span always wins (it can't nest inside a
+    /// code fence in practice), otherwise `.code` while inside a ```-fenced
+    /// block, otherwise none.
+    fn currentGutter(self: *Tui) Gutter {
+        if (self.gutter_state != .none) return self.gutter_state;
+        if (self.in_code) return .code;
+        return .none;
+    }
+
     /// Overwrites the currently pending tool dot's `tool_dot_len` bytes in
     /// place with `final_dot` (`tool_dot_ok`/`tool_dot_fail`) and clears
     /// `pending_tool_dot`. Safe to call with no pending dot (no-op).
@@ -707,13 +763,24 @@ pub const Tui = struct {
     /// `gutter_cols` of width for guttered rows so `renderMessages` can
     /// prepend the gutter without overflowing the terminal width.
     fn wrapLogicalLine(self: *Tui, abs_start: usize, line: []const u8) void {
+        // A ```-fence line toggles code-block state before anything else on
+        // this line is measured. The toggle alone would make the *closing*
+        // fence read as `.none` (state has already flipped off by the time
+        // its own gutter is picked) — `line_gutter` pins both the opening
+        // and closing fence to `.code` explicitly so the tinted block reads
+        // as a visible border around the lines it delimits, not just the
+        // lines strictly between them.
+        const is_fence = std.mem.startsWith(u8, line, "```");
+        if (is_fence) self.in_code = !self.in_code;
+        const line_gutter: ?Gutter = if (is_fence) .code else null;
+
         const base_width: usize = if (self.cols > 0) self.cols else 80;
         if (line.len == 0) {
-            self.rows_cache.append(self.gpa, .{ .start = abs_start, .len = 0, .gutter = self.gutter_state }) catch {};
+            self.rows_cache.append(self.gpa, .{ .start = abs_start, .len = 0, .gutter = line_gutter orelse self.currentGutter() }) catch {};
             return;
         }
         var seg_start: usize = 0;
-        var seg_gutter = self.gutter_state;
+        var seg_gutter = line_gutter orelse self.currentGutter();
         var width = gutterWidth(base_width, seg_gutter);
         var col: usize = 0;
         var i: usize = 0;
@@ -749,7 +816,7 @@ pub const Tui = struct {
                 // common case (marker at line start) reserve gutter width
                 // correctly.
                 if (col == 0) {
-                    seg_gutter = self.gutter_state;
+                    seg_gutter = line_gutter orelse self.currentGutter();
                     width = gutterWidth(base_width, seg_gutter);
                 }
                 continue; // zero width, doesn't count toward col
@@ -760,7 +827,7 @@ pub const Tui = struct {
                 self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = i - seg_start, .gutter = seg_gutter }) catch {};
                 seg_start = i;
                 col = 0;
-                seg_gutter = self.gutter_state;
+                seg_gutter = line_gutter orelse self.currentGutter();
                 width = gutterWidth(base_width, seg_gutter);
             }
             col += cw;
@@ -799,6 +866,7 @@ pub const Tui = struct {
         self.rows_cache.clearRetainingCapacity();
         self.last_line_start = 0;
         self.gutter_state = .none;
+        self.in_code = false;
         self.rewrapTail();
     }
 
@@ -1014,30 +1082,72 @@ pub const Tui = struct {
         }
     }
 
-    /// Writes row text to the terminal; with colors disabled, SGR/CSI
+    /// Writes row text to the terminal. With colors disabled, SGR/CSI
     /// escape sequences are stripped so NO_COLOR output is genuinely plain.
-    fn writeRowFiltered(self: *Tui, text: []const u8) void {
-        if (self.theme.colors) {
+    /// With colors enabled, any embedded SGR (wire markers, tool-marker
+    /// inline styling) passes through untouched; when `highlight_inline` is
+    /// set, `` `backtick` `` spans additionally get colored as inline code.
+    /// Highlighting is render-time and row-local: a span split across a
+    /// wrapped-row boundary loses its color on the far side, and a span
+    /// still open at row end is force-closed with `fg_reset` so it can
+    /// never bleed into whatever renders next. Callers pass `false` for
+    /// `.thinking`/`.err` rows — those spans carry their *own* wire-level
+    /// color that persists across many rows via terminal state (no
+    /// re-emission per row), and `fg_reset` closing an inline-code span
+    /// would permanently strip that color for the rest of the span, not
+    /// just the backtick run.
+    fn writeRowFiltered(self: *Tui, text: []const u8, highlight_inline: bool) void {
+        if (!self.theme.colors) {
+            var start: usize = 0;
+            var i: usize = 0;
+            while (i < text.len) {
+                if (text[i] == 0x1b) {
+                    self.rawWrite(text[start..i]);
+                    i += 1;
+                    if (i < text.len and text[i] == '[') {
+                        i += 1;
+                        while (i < text.len and !(text[i] >= 0x40 and text[i] <= 0x7e)) : (i += 1) {}
+                        if (i < text.len) i += 1;
+                    }
+                    start = i;
+                    continue;
+                }
+                i += 1;
+            }
+            self.rawWrite(text[start..]);
+            return;
+        }
+        if (!highlight_inline) {
             self.rawWrite(text);
             return;
         }
-        var start: usize = 0;
+
+        var in_span = false;
         var i: usize = 0;
         while (i < text.len) {
             if (text[i] == 0x1b) {
-                self.rawWrite(text[start..i]);
+                const esc_start = i;
                 i += 1;
                 if (i < text.len and text[i] == '[') {
                     i += 1;
                     while (i < text.len and !(text[i] >= 0x40 and text[i] <= 0x7e)) : (i += 1) {}
                     if (i < text.len) i += 1;
                 }
-                start = i;
+                self.rawWrite(text[esc_start..i]);
                 continue;
             }
-            i += 1;
+            if (text[i] == '`') {
+                self.rawWrite(if (in_span) self.theme.fg_reset else self.theme.inline_code);
+                in_span = !in_span;
+                self.rawWrite("`");
+                i += 1;
+                continue;
+            }
+            const d = decodeCp(text[i..]);
+            self.rawWrite(text[i .. i + d.len]);
+            i += d.len;
         }
-        self.rawWrite(text[start..]);
+        if (in_span) self.rawWrite(self.theme.fg_reset);
     }
 
     /// Redraws the message viewport from `rows_cache`, honoring
@@ -1054,8 +1164,14 @@ pub const Tui = struct {
         var row: u16 = 0;
         while (row < viewport_h) : (row += 1) {
             self.writeFmt("\x1b[{d};1H", .{row + 1});
-            self.rawWrite("\x1b[2K");
             const idx = start + row;
+            // A code row's background tint is set *before* the line-erase
+            // below so the erase fills the whole row width with it (the
+            // standard "set bg, then erase-to-eol" trick) — a plain string
+            // write can only tint the columns it covers.
+            const upcoming_gutter: Gutter = if (idx < total) self.rows_cache.items[idx].gutter else .none;
+            if (upcoming_gutter == .code) self.rawWrite(self.theme.code_bg);
+            self.rawWrite("\x1b[2K");
             if (idx < total) {
                 const r = self.rows_cache.items[idx];
                 switch (r.gutter) {
@@ -1072,8 +1188,20 @@ pub const Tui = struct {
                         self.rawWrite(self.theme.reset);
                         self.rawWrite(" ");
                     },
+                    .code => {
+                        self.rawWrite(self.theme.code_bar);
+                        self.rawWrite("\u{2502}");
+                        // fg-only reset: the code-block background painted
+                        // above must survive into the row text that follows.
+                        self.rawWrite(self.theme.fg_reset);
+                        self.rawWrite(" ");
+                    },
                 }
-                self.writeRowFiltered(self.rowText(r));
+                self.writeRowFiltered(self.rowText(r), r.gutter == .none or r.gutter == .code);
+                // Detection here is render-time (fence bytes, not a wire
+                // marker), so unlike thinking/err spans nothing in the row
+                // text itself carries a closing reset — do it explicitly.
+                if (r.gutter == .code) self.rawWrite(self.theme.reset);
             }
         }
     }
@@ -1111,7 +1239,17 @@ pub const Tui = struct {
         var left_buf: [160]u8 = undefined;
         var left: []const u8 = undefined;
         var left_is_busy = false;
-        if (self.busy) {
+        if (self.approval_text) |q| {
+            // Top-priority state: the orchestrator is blocked on a yes/no.
+            // Truncate the question (never the controls) to fit the row.
+            left_is_busy = true;
+            const fixed = "\u{25CF} allow?  \u{B7} y run \u{B7} n deny";
+            const budget = @min(@as(usize, self.cols) -| displayWidth(fixed), 100);
+            const shown = truncateCols(q, budget);
+            left = std.fmt.bufPrint(&left_buf, "\u{25CF} allow? {s}{s} \u{B7} y run \u{B7} n deny", .{
+                shown, if (shown.len < q.len) "\u{2026}" else "",
+            }) catch "\u{25CF} allow? \u{B7} y run \u{B7} n deny";
+        } else if (self.busy) {
             left_is_busy = true;
             if (self.cancelling) {
                 left = "\u{25CF} cancelling\u{2026}";
@@ -1152,7 +1290,8 @@ pub const Tui = struct {
         // Left: busy state gets a colored spinner glyph, the rest is dim.
         if (left_is_busy and self.theme.colors) {
             // First glyph of `left` is the 3-byte "●" — color it warn/err.
-            self.rawWrite(if (self.cancelling) self.theme.err_c else self.theme.warn);
+            // An approval prompt gets the err color: stop, decision needed.
+            self.rawWrite(if (self.cancelling or self.approval_text != null) self.theme.err_c else self.theme.warn);
             self.rawWrite(left[0..3]);
             self.rawWrite(self.theme.reset);
             self.rawWrite(self.theme.dim);
@@ -1183,6 +1322,7 @@ pub const Tui = struct {
         "Ctrl+W / U    delete word / clear input",
         "PgUp PgDn     scroll transcript (wheel too)",
         "Esc           cancel turn \u{B7} jump tail \u{B7} clear",
+        "y / n         allow / deny a command prompt",
         "Ctrl+P        toggle react / todo style",
         "Ctrl+L        redraw screen",
         "Ctrl+Z        suspend",
@@ -1289,6 +1429,26 @@ pub const Tui = struct {
         self.cancelling = true;
         self.drawBar();
         if (!self.help_visible) self.positionCursor();
+    }
+
+    /// Shows the human-approval prompt in the bar (takes a gpa-owned copy
+    /// of `question`); the main loop routes y/n to the agent while active.
+    pub fn setApproval(self: *Tui, question: []const u8) void {
+        if (self.approval_text) |old| self.gpa.free(old);
+        self.approval_text = self.gpa.dupe(u8, question) catch null;
+        self.drawBar();
+        if (!self.help_visible) self.positionCursor();
+    }
+
+    pub fn clearApproval(self: *Tui) void {
+        if (self.approval_text) |old| self.gpa.free(old);
+        self.approval_text = null;
+        self.drawBar();
+        if (!self.help_visible) self.positionCursor();
+    }
+
+    pub fn approvalActive(self: *Tui) bool {
+        return self.approval_text != null;
     }
 
     pub fn toggleHelp(self: *Tui) void {
@@ -1640,6 +1800,17 @@ pub fn takeResized() bool {
 
 const testing = std.testing;
 
+/// The raw O_NONBLOCK bit for the fcntl(F_SETFL) calls below. Not
+/// `0o4000` — that's the Linux value; on Darwin `NONBLOCK` sits at bit 2
+/// of `posix.O` (after the 2-bit `ACCMODE` field), i.e. `4`. Using the
+/// wrong bit is a silent no-op (fcntl still returns success), so a "frame"
+/// test's drain loop below blocks forever in `read()` once the pipe empties
+/// — the write end stays open until after the loop, so there's no EOF to
+/// stop it either. Derived from the struct rather than hardcoded again so
+/// it can't drift from `posix.O`'s actual layout on whatever target this
+/// is compiled for.
+const o_nonblock: c_int = @bitCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+
 fn testTui() !Tui {
     const null_fd = try posix.openatZ(posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
     return Tui.init(testing.allocator, null_fd, Theme.init(true));
@@ -1792,11 +1963,45 @@ test "error span: agent error markers produce err-guttered rows" {
         switch (r.gutter) {
             .err => saw_err = true,
             .none => saw_none = true,
-            .thinking => return error.TestUnexpectedResult,
+            .thinking, .code => return error.TestUnexpectedResult,
         }
     }
     try testing.expect(saw_err);
     try testing.expect(saw_none);
+}
+
+test "code fence: a ```-delimited block produces code-guttered rows, including the fence lines" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    ui.appendOutput("before\n```zig\nconst x = 1;\n```\nafter");
+    var saw_code = false;
+    var saw_none = false;
+    var code_rows: usize = 0;
+    for (ui.rows_cache.items) |r| {
+        switch (r.gutter) {
+            .code => {
+                saw_code = true;
+                code_rows += 1;
+            },
+            .none => saw_none = true,
+            .thinking, .err => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expect(saw_code);
+    try testing.expect(saw_none);
+    // Both fence lines plus the one content line = 3 code-guttered rows.
+    try testing.expectEqual(@as(usize, 3), code_rows);
+    // The fence toggles closed, so trailing content is ungoverned again.
+    try testing.expect(!ui.in_code);
+}
+
+test "inline code: a backtick span is colored and does not bleed past its closing tick" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    ui.appendOutput("run `zig build test` now\n");
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "`zig build test`") != null);
 }
 
 test "processStream: bracketed content flows through to the transcript untouched" {
@@ -1868,7 +2073,7 @@ test "frame: pinned 80x24 render carries transcript, prompt, and bar" {
     defer _ = std.c.close(pipe_fds[0]);
     // Non-blocking read end so the drain loop below terminates.
     const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
-    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | @as(c_int, 0o4000)); // O_NONBLOCK
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | o_nonblock); // O_NONBLOCK
 
     var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(true));
     defer {
@@ -1907,7 +2112,7 @@ test "frame: todo panel renders above the composer with a done/total header and 
     if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
     defer _ = std.c.close(pipe_fds[0]);
     const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
-    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | @as(c_int, 0o4000)); // O_NONBLOCK
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | o_nonblock); // O_NONBLOCK
 
     var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(true));
     defer {
@@ -1943,7 +2148,7 @@ test "NO_COLOR: rendered output contains no SGR sequences" {
     if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
     defer _ = std.c.close(pipe_fds[0]);
     const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
-    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | @as(c_int, 0o4000));
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | o_nonblock);
 
     var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(false));
     defer {

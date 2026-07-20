@@ -30,14 +30,19 @@ const execute_command = @import("plugins/tools/execute_command.zig");
 const todo_write = @import("plugins/tools/todo_write.zig");
 const tool_audit_log = @import("plugins/hooks/tool_audit_log.zig");
 const todo_tracker = @import("plugins/hooks/todo_tracker.zig");
+const command_guard = @import("plugins/hooks/command_guard.zig");
+const system_prompt = @import("plugins/hooks/system_prompt.zig");
 const tui_mod = @import("tui/app.zig");
 
 const Tools = .{ calculator, word_count, read_file, write_file, list_files, execute_command, todo_write };
 // Interceptor hooks (core/hook.zig, design doc §3.7) fire in tuple order.
-// `tool_audit_log` is the observe-only sample hook the design shipped
-// with; drop it from this tuple to silence the audit lines. `todo_tracker`
+// `system_prompt` pins the devops reliability prompt at the top of every
+// outbound view; `tool_audit_log` is the observe-only sample hook the
+// design shipped with (drop it from this tuple to silence the audit
+// lines); `command_guard` gates destructive `execute_command` calls behind
+// interactive approval (§3.9) and fails closed headless; `todo_tracker`
 // pairs with the `todo_write` tool above (design doc §3.8).
-const Hooks = .{ tool_audit_log, todo_tracker };
+const Hooks = .{ system_prompt, tool_audit_log, command_guard, todo_tracker };
 const Agent = agent_mod.Agent(Tools, llm.Glm, Hooks);
 
 // `zig build test` walks the whole `@import` graph for source, but Zig
@@ -51,8 +56,11 @@ test {
     std.testing.refAllDecls(@import("core/hook.zig"));
     std.testing.refAllDecls(@import("core/tool.zig"));
     std.testing.refAllDecls(@import("plugins/tools/todo_write.zig"));
+    std.testing.refAllDecls(@import("plugins/tools/execute_command.zig"));
     std.testing.refAllDecls(@import("plugins/hooks/tool_audit_log.zig"));
     std.testing.refAllDecls(@import("plugins/hooks/todo_tracker.zig"));
+    std.testing.refAllDecls(@import("plugins/hooks/command_guard.zig"));
+    std.testing.refAllDecls(@import("plugins/hooks/system_prompt.zig"));
     std.testing.refAllDecls(@import("tui/app.zig"));
 }
 
@@ -259,6 +267,20 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
         }
 
         ui.setBusy(agent.state.thinking.load(.acquire));
+
+        // Human-in-the-loop approval (design doc §3.9): surface a pending
+        // question in the bar; resolution (answer or cancel) clears it.
+        if (agent.approvalPending()) {
+            if (!ui.approvalActive()) {
+                if (agent.copyApprovalQuestion(gpa)) |q| {
+                    defer gpa.free(q);
+                    ui.setApproval(q);
+                }
+            }
+        } else if (ui.approvalActive()) {
+            ui.clearApproval();
+        }
+
         _ = ui.tickDots();
 
         // Handle keypress
@@ -342,13 +364,25 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
                     .none => {},
                 },
                 else => {
-                    const submitted = ui.handleKey(key);
-                    if (submitted) {
-                        const text = ui.takeInput();
-                        if (text.len > 0) {
-                            ui.beginTurn();
-                            ui.setBusy(true);
-                            agent.submit(text);
+                    if (ui.approvalActive()) {
+                        // y/n answer the blocked orchestrator; everything
+                        // else is swallowed so stray typing can't approve
+                        // or land in the composer mid-prompt (Esc above
+                        // still cancels the whole turn, which denies).
+                        switch (key) {
+                            'y', 'Y' => agent.answerApproval(true),
+                            'n', 'N' => agent.answerApproval(false),
+                            else => {},
+                        }
+                    } else {
+                        const submitted = ui.handleKey(key);
+                        if (submitted) {
+                            const text = ui.takeInput();
+                            if (text.len > 0) {
+                                ui.beginTurn();
+                                ui.setBusy(true);
+                                agent.submit(text);
+                            }
                         }
                     }
                 },

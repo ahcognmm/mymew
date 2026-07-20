@@ -133,6 +133,11 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
         /// a cancel that lands after a turn already finished can't kill the
         /// next one.
         cancel_requested: std.atomic.Value(bool) = .init(false),
+        /// Human-in-the-loop bridge handed to hooks via `Ctx.approver`
+        /// (design doc §3.9). Set once by the frontend before any turn
+        /// runs (`Agent.spawn` does it for the TUI path); never mutated
+        /// mid-turn, so no atomics needed.
+        approver: ?hook.Approver = null,
 
         pub fn init(gpa: std.mem.Allocator, io: Io, provider: *Provider, mem: *memory.Memory) Self {
             return .{ .provider = provider, .mem = mem, .gpa = gpa, .io = io };
@@ -140,6 +145,12 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
 
         pub fn setStyle(self: *Self, s: Style) void {
             self.style.store(s, .release);
+        }
+
+        /// Registers the frontend's approval bridge; call before the first
+        /// `step()`. Hooks see it as `Ctx.approver` from then on.
+        pub fn setApprover(self: *Self, a: hook.Approver) void {
+            self.approver = a;
         }
 
         /// Asks the running turn to stop at its next loop boundary (§3.4).
@@ -225,6 +236,7 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
                 .scratch = turn_arena.allocator(),
                 .writer = writer,
                 .style = self.style.load(.acquire),
+                .approver = self.approver,
             };
 
             var text = user_text;
@@ -292,6 +304,7 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
                 .scratch = scratch,
                 .writer = writer,
                 .style = self.style.load(.acquire),
+                .approver = self.approver,
             };
 
             while (true) {
@@ -409,7 +422,12 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
             const action = try self.describeToolCall(tc.name, args_json);
             defer self.gpa.free(action);
             if (writer) |w| {
-                try w.print("\n[{s} {s}: {s}]", .{ tool_pending_sgr_full, tc.name, action });
+                // Name bold+cyan, action dim — otherwise both render in the
+                // terminal's default color (the dot's own reset lands right
+                // before them), making a tool call read as plain text
+                // indistinguishable from surrounding prose. `tui/app.zig`
+                // strips all of this at render time when colors are off.
+                try w.print("\n[{s} \x1b[1;36m{s}\x1b[22;39m: \x1b[2m{s}\x1b[22m]", .{ tool_pending_sgr_full, tc.name, action });
                 try w.flush();
             }
 
@@ -650,7 +668,7 @@ test "step: tool-call marker is one line — dot, name, action, then a done-sign
     try testing.expect(std.mem.indexOf(
         u8,
         bytes,
-        "[" ++ tool_dot_pending ++ " calculator: add 2 and 3]" ++ tool_done_ok_sgr,
+        "[" ++ tool_dot_pending ++ " \x1b[1;36mcalculator\x1b[22;39m: \x1b[2madd 2 and 3\x1b[22m]" ++ tool_done_ok_sgr,
     ) != null);
     // No trace of the old two-line "[-> tool]" / "[<- result]" format.
     try testing.expect(std.mem.indexOf(u8, bytes, "[->") == null);
@@ -968,12 +986,62 @@ test "hooks: tool_audit_log writes framed audit lines without breaking the one-l
     const marker = std.mem.indexOf(
         u8,
         bytes,
-        "[" ++ tool_dot_pending ++ " calculator: add 2 and 3]" ++ tool_done_ok_sgr ++ "\n",
+        "[" ++ tool_dot_pending ++ " \x1b[1;36mcalculator\x1b[22;39m: \x1b[2madd 2 and 3\x1b[22m]" ++ tool_done_ok_sgr ++ "\n",
     ).?;
     // postTool audit line comes after the terminated marker line.
     const audit_post = std.mem.indexOf(u8, bytes, "[hook] calculator returned 1 bytes: 5\n").?;
     try testing.expect(audit_pre < marker);
     try testing.expect(marker < audit_post);
+}
+
+test "hooks: preTool sees the engine's approver through Ctx and can gate on its answer" {
+    const DenyingApprover = struct {
+        var asked_with: ?[]const u8 = null;
+        fn request(ptr: *anyopaque, question: []const u8) bool {
+            _ = ptr;
+            asked_with = question;
+            return false;
+        }
+    };
+    const GateHook = struct {
+        pub fn name() []const u8 {
+            return "gate_hook";
+        }
+        pub fn preTool(ctx: hook.Ctx, tool_name: []const u8, args_json: *[]const u8) anyerror!hook.PreToolAction {
+            _ = tool_name;
+            _ = args_json;
+            const approver = ctx.approver orelse return .{ .veto = "no approver attached" };
+            if (approver.request("run calculator?")) return .proceed;
+            return .{ .veto = try ctx.scratch.dupe(u8, "denied by user") };
+        }
+    };
+
+    var mock: llm.Mock = .{ .script = &.{
+        .{ .role = .assistant, .tool_calls = &.{
+            .{ .id = "call_1", .name = "calculator", .arguments_json = "{\"op\":\"add\",\"a\":2,\"b\":3}" },
+        } },
+        .{ .role = .assistant, .content = "understood" },
+    } };
+
+    const path = "/tmp/mymew_test_hook_approver.jsonl";
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var mem = try memory.Memory.init(testing.allocator, io, path);
+    defer mem.deinit();
+
+    var eng = Engine(TestTools, llm.Mock, .{GateHook}).init(testing.allocator, io, &mock, &mem);
+    var dummy: u8 = 0;
+    eng.setApprover(.{ .ptr = &dummy, .requestFn = DenyingApprover.request });
+
+    const outcome = try eng.step("what is 2 + 3?", null);
+    try testing.expect(outcome == .final);
+    // The approver was consulted with the hook's question, and its denial
+    // became the persisted tool result (the tool never ran).
+    try testing.expectEqualStrings("run calculator?", DenyingApprover.asked_with.?);
+    try testing.expectEqualStrings("denied by user", mem.items()[2].content);
 }
 
 test "hooks: onTurnStart rewrites the user text before it reaches memory" {

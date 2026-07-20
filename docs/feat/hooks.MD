@@ -92,3 +92,9 @@ A `tool_audit_log` hook under a new `src/plugins/hooks/` directory (mirroring `s
 ## Implementation notes
 
 The design above was implemented after review (same change as these amendments): `src/core/hook.zig`, hook wiring in `src/core/engine.zig`, `Hooks` forwarding in `src/core/agent.zig`/`src/main.zig`, the `tool_audit_log` sample hook in `src/plugins/hooks/`, and inline tests in `engine.zig` covering veto, mutation, override, injection, and escalation-report paths.
+
+## Addendum: `Ctx.approver` (design doc §3.9)
+
+`Ctx` grew a fifth field, `approver: ?Approver = null`, so a hook can block the orchestrator thread on a human yes/no without a new hook point — `preTool`'s existing veto/proceed return value already covers "should this run." `Approver` (`core/hook.zig`) is `{ ptr: *anyopaque, requestFn: *const fn(ptr, question: []const u8) bool }`, type-erased so `hook.zig` still imports only `std`. `Engine.setApprover()` sets it once before the first `step()`; both `Ctx{...}` construction sites in `engine.zig` (turn-level in `step()`, loop-level in `runToolLoop`) copy `self.approver` in alongside `style`. Absent approver means fail closed — a policy hook must veto, not default to proceeding, when `ctx.approver == null`.
+
+`core/agent.zig`'s `Agent.spawn()` registers itself as the approver: `requestApproval` parks the question in `io_bus.AgentState`'s existing `mutex`/`cond`, pings the wakeup fd, and blocks until `answerApproval()` is called or `requestCancel()` fires (treated as a deny — the same "cancel is a way out, never a hang" convention as §3.4). See `plugins/hooks/command_guard.zig` for the reference consumer.
