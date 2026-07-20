@@ -89,10 +89,10 @@ pub const Theme = struct {
     bold: []const u8,
     dim: []const u8,
     reset: []const u8,
-    accent: []const u8, // cyan — prompt, thinking gutter, plan-panel gutter
+    accent: []const u8, // cyan — prompt, thinking gutter, todo-panel gutter
     err_c: []const u8, // red — error gutter
-    warn: []const u8, // yellow — busy spinner, running plan step
-    ok: []const u8, // green — completed plan step
+    warn: []const u8, // yellow — busy spinner, in_progress todo item
+    ok: []const u8, // green — completed todo item
 
     pub fn init(colors: bool) Theme {
         if (!colors) return .{
@@ -467,38 +467,39 @@ pub const Tui = struct {
 
     /// Deliberately plain bools/ints, not `core.engine` types — this file
     /// has no dependency on `core/*` and shouldn't gain one for labels.
-    plan_execute: bool = false,
+    /// Drives the bar's `[react]`/`[todo]` tag (design doc §3.5); the
+    /// engine-side effect of this toggle (a hook-injected system nudge) is
+    /// invisible here — this file only labels the current mode.
+    todo_mode: bool = false,
     busy: bool = false,
     cancelling: bool = false,
     help_visible: bool = false,
-    /// Live plan progress parsed from the `[step i/n: ...]` stream markers
-    /// (0/0 = none). Feeds both the bar's `[plan i/n]` tag and the plan
-    /// panel; reset each turn.
-    plan_step_i: usize = 0,
-    plan_step_n: usize = 0,
-
-    /// Plan-panel state (design doc §5.1), fed by `processStream`'s marker
-    /// filter: during a plan-execute turn the `[plan]…[/plan]` block is
-    /// diverted out of the transcript into `plan_steps`, and the
-    /// `[step]`/`[/step]`/`[synthesis]` markers drive live progress. The
-    /// panel renders between transcript and composer while `plan_phase !=
-    /// .none` and disappears when the turn ends.
-    plan_phase: enum { none, planning, executing, synthesis } = .none,
-    plan_steps: std.ArrayList([]const u8),
-    plan_current_done: bool = false,
-    /// Raw bytes captured between `[plan]` and `[/plan]`.
-    plan_buf: std.ArrayList(u8),
-    /// True while stream content is being diverted into `plan_buf`.
-    capturing_plan: bool = false,
-    /// Hold-back buffer for a line that may still turn out to be a phase
-    /// marker (`processStream`). Persists across chunk boundaries — the
-    /// engine's markers can arrive split across channel drains.
-    filter_line: std.ArrayList(u8),
-    /// Whether the next streamed byte starts a line (for marker detection).
+    /// Whether the next streamed byte starts a line (also drives marker
+    /// detection in `processStream`).
     line_start: bool = true,
-    /// Plan-panel height in rows for the current frame (0 = hidden);
+
+    /// Todo panel state (design doc §5.1/§3.8), fed by `processStream`'s
+    /// `[todos]`/`[/todos]` marker capture and by `setTodos` (also called
+    /// directly at startup to hydrate from persisted memory — see
+    /// `main.zig`). Each entry is one already-glyphed line as `todo_write`
+    /// rendered it (`"✓ locate plan-mode code"`) — the panel colors by
+    /// leading glyph rather than tracking status itself. Unlike the old
+    /// plan panel, nothing resets this on turn end: a todo list is a
+    /// standing, multi-turn artifact.
+    todo_lines: std.ArrayList([]const u8),
+    todo_total: usize = 0,
+    todo_done: usize = 0,
+    /// Todo-panel height in rows for the current frame (0 = hidden);
     /// computed by `renderAll`, read by `msgViewportRows`.
-    panel_h: u16 = 0,
+    todo_panel_h: u16 = 0,
+    /// Hold-back buffer for a line that may still turn out to be a
+    /// `[todos]`/`[/todos]` marker (`processStream`). Persists across chunk
+    /// boundaries — markers can arrive split across channel drains.
+    filter_line: std.ArrayList(u8),
+    /// True while stream content is being diverted into `todo_buf`.
+    capturing_todos: bool = false,
+    /// Raw bytes captured between `[todos]` and `[/todos]`.
+    todo_buf: std.ArrayList(u8),
 
     /// Static context labels for the bar's right side; set once via
     /// `setContext`, borrowed (caller keeps them alive for the whole run).
@@ -528,9 +529,9 @@ pub const Tui = struct {
             .transcript = .empty,
             .rows_cache = .empty,
             .comp_rows = .empty,
-            .plan_steps = .empty,
-            .plan_buf = .empty,
+            .todo_lines = .empty,
             .filter_line = .empty,
+            .todo_buf = .empty,
         };
     }
 
@@ -539,15 +540,15 @@ pub const Tui = struct {
         self.rows_cache.deinit(self.gpa);
         self.composer.deinit(self.gpa);
         self.comp_rows.deinit(self.gpa);
-        self.clearPlanSteps();
-        self.plan_steps.deinit(self.gpa);
-        self.plan_buf.deinit(self.gpa);
+        self.clearTodoLines();
+        self.todo_lines.deinit(self.gpa);
         self.filter_line.deinit(self.gpa);
+        self.todo_buf.deinit(self.gpa);
     }
 
-    fn clearPlanSteps(self: *Tui) void {
-        for (self.plan_steps.items) |s| self.gpa.free(s);
-        self.plan_steps.clearRetainingCapacity();
+    fn clearTodoLines(self: *Tui) void {
+        for (self.todo_lines.items) |s| self.gpa.free(s);
+        self.todo_lines.clearRetainingCapacity();
     }
 
     fn rawWrite(self: *Tui, bytes: []const u8) void {
@@ -606,19 +607,19 @@ pub const Tui = struct {
     }
 
     fn msgViewportRows(self: *Tui) u16 {
-        const chrome = self.comp_h + 1 + self.panel_h; // composer + bar + plan panel
+        const chrome = self.comp_h + 1 + self.todo_panel_h; // composer + bar + todo panel
         return if (self.rows > chrome) self.rows - chrome else 1;
     }
 
-    /// Rows the plan panel gets this frame: 0 when idle, header-only on
-    /// short terminals, else header + up to 6 step rows — never squeezing
+    /// Rows the todo panel gets this frame: 0 when empty, header-only on
+    /// short terminals, else header + up to 6 item rows — never squeezing
     /// the transcript below 8 rows.
-    fn planPanelHeight(self: *Tui) u16 {
-        if (self.plan_phase == .none) return 0;
+    fn todoPanelHeight(self: *Tui) u16 {
+        if (self.todo_lines.items.len == 0) return 0;
         if (self.rows < 16) return 1; // header only
         const chrome: usize = @as(usize, self.comp_h) + 1;
         const max_h: usize = if (self.rows > chrome + 8) self.rows - chrome - 8 else 1;
-        const want: usize = 1 + @min(self.plan_steps.items.len, 6);
+        const want: usize = 1 + @min(self.todo_lines.items.len, 6);
         return @intCast(@max(@min(want, max_h), 1));
     }
 
@@ -652,9 +653,9 @@ pub const Tui = struct {
         }
         self.rawWrite("\x1b[?25l");
         self.layoutComposer();
-        self.panel_h = self.planPanelHeight();
+        self.todo_panel_h = self.todoPanelHeight();
         self.renderMessages();
-        self.drawPlanPanel();
+        self.drawTodoPanel();
         self.drawComposer();
         self.drawBar();
         if (self.help_visible) {
@@ -804,7 +805,7 @@ pub const Tui = struct {
     /// Appends locally generated bytes (the "You:" label, the round-trip
     /// time line) straight to the transcript, stripping '\r'. Does NOT
     /// rewrap or render — callers batch that. Streamed agent output goes
-    /// through `processStream` instead, which filters phase markers.
+    /// through `processStream` instead.
     fn appendBytes(self: *Tui, bytes: []const u8) void {
         if (bytes.len == 0) return;
         var start: usize = 0;
@@ -818,29 +819,19 @@ pub const Tui = struct {
         self.line_start = bytes[bytes.len - 1] == '\n';
     }
 
-    /// Plan-and-execute phase markers (design doc §3.5 point 4 — the
-    /// bracket-marker convention exists precisely so a stream consumer can
-    /// find phase boundaries). These lines are consumed by the plan panel
-    /// and never reach the transcript.
-    const phase_markers = [_][]const u8{
-        "[planning...]",
-        "[plan]",
-        "[/plan]",
-        "[plan unavailable, proceeding directly]",
-        "[synthesis]",
-        "[/synthesis]",
-    };
+    /// The only markers `processStream` recognizes (design doc §3.8) — far
+    /// smaller than the old Plan-and-Execute phase-marker table, since a
+    /// todo-list block only needs a start/end pair, no free-form step
+    /// markers.
+    const todo_markers = [_][]const u8{ "[todos]", "[/todos]" };
 
-    /// Could `h` (a line fragment starting with '[') still grow into a
-    /// phase marker line? Step markers carry a free-form description, so
-    /// any completion of their prefix stays a candidate until newline.
+    /// Could `h` (a line fragment starting with '[') still grow into one of
+    /// `todo_markers`?
     fn markerCandidate(h: []const u8) bool {
-        if (std.mem.startsWith(u8, h, "[step ") or std.mem.startsWith(u8, h, "[/step ")) return true;
-        if (std.mem.startsWith(u8, "[step ", h) or std.mem.startsWith(u8, "[/step ", h)) return true;
-        for (phase_markers) |p| {
-            if (h.len <= p.len) {
-                if (std.mem.startsWith(u8, p, h)) return true;
-            } else if (std.mem.startsWith(u8, h, p)) {
+        for (todo_markers) |m| {
+            if (h.len <= m.len) {
+                if (std.mem.startsWith(u8, m, h)) return true;
+            } else if (std.mem.startsWith(u8, h, m)) {
                 // Full marker matched but the line continues — hold until
                 // the newline proves/disproves an exact match.
                 return true;
@@ -850,19 +841,19 @@ pub const Tui = struct {
     }
 
     /// Streamed-output front door: routes bytes to the transcript (or,
-    /// inside a `[plan]` block, to `plan_buf`) while holding back any line
-    /// that may be a phase marker. Hold-back is prefix-driven, so ordinary
-    /// content — including the tool-dot marker lines, whose second byte is
-    /// ESC — flushes through after at most a byte or two of buffering; the
-    /// buffer survives across calls because markers can arrive split
-    /// across channel drains.
+    /// inside a `[todos]` block, to `todo_buf`) while holding back any line
+    /// that may be a `[todos]`/`[/todos]` marker. Hold-back is
+    /// prefix-driven, so ordinary content — including the tool-dot marker
+    /// lines, whose second byte is ESC — flushes through after at most a
+    /// byte or two of buffering; the buffer survives across calls because
+    /// markers can arrive split across channel drains.
     fn processStream(self: *Tui, bytes: []const u8) void {
         for (bytes) |b| {
             if (self.filter_line.items.len > 0) {
                 self.filter_line.append(self.gpa, b) catch {};
                 if (b == '\n') {
                     self.classifyFilterLine();
-                } else if (self.filter_line.items.len > 512 or !markerCandidate(self.filter_line.items)) {
+                } else if (self.filter_line.items.len > 16 or !markerCandidate(self.filter_line.items)) {
                     self.flushFilterLine();
                 }
                 continue;
@@ -876,8 +867,8 @@ pub const Tui = struct {
     }
 
     fn routeByte(self: *Tui, b: u8) void {
-        if (self.capturing_plan) {
-            self.plan_buf.append(self.gpa, b) catch {};
+        if (self.capturing_todos) {
+            self.todo_buf.append(self.gpa, b) catch {};
         } else if (b != '\r') {
             self.transcript.append(self.gpa, b) catch {};
         }
@@ -890,97 +881,46 @@ pub const Tui = struct {
         self.filter_line.clearRetainingCapacity();
     }
 
-    /// A complete '['-line arrived: act on a phase marker (suppressing it
-    /// from the transcript) or flush it as content.
+    /// A complete '['-line arrived: act on a `[todos]`/`[/todos]` marker
+    /// (suppressing it from the transcript) or flush it as content.
     fn classifyFilterLine(self: *Tui) void {
         const with_nl = self.filter_line.items;
         const line = with_nl[0 .. with_nl.len - 1];
-        var handled = true;
-        if (std.mem.eql(u8, line, "[planning...]")) {
-            self.plan_phase = .planning;
-        } else if (std.mem.eql(u8, line, "[plan]")) {
-            self.capturing_plan = true;
-            self.plan_buf.clearRetainingCapacity();
-        } else if (std.mem.eql(u8, line, "[/plan]")) {
-            self.capturing_plan = false;
-            self.parsePlanBuf();
-            self.plan_phase = .executing;
-        } else if (std.mem.eql(u8, line, "[plan unavailable, proceeding directly]")) {
-            self.plan_phase = .executing;
-        } else if (std.mem.eql(u8, line, "[synthesis]")) {
-            self.plan_phase = .synthesis;
-            self.plan_current_done = true;
-        } else if (std.mem.eql(u8, line, "[/synthesis]")) {
-            // phase stays .synthesis until the turn ends
-        } else if (std.mem.startsWith(u8, line, "[step ")) {
-            handled = self.parseStepMarker(line);
-        } else if (std.mem.startsWith(u8, line, "[/step ")) {
-            self.plan_current_done = true;
-        } else {
-            handled = false;
-        }
-        if (handled) {
-            self.filter_line.clearRetainingCapacity();
-            self.line_start = true;
+        if (std.mem.eql(u8, line, "[todos]")) {
+            self.capturing_todos = true;
+            self.todo_buf.clearRetainingCapacity();
+        } else if (std.mem.eql(u8, line, "[/todos]")) {
+            self.capturing_todos = false;
+            self.setTodos(self.todo_buf.items);
         } else {
             self.flushFilterLine();
+            return;
         }
+        self.filter_line.clearRetainingCapacity();
+        self.line_start = true;
     }
 
-    /// `[step i/n: desc]` → current step + bar tag; in the degrade path
-    /// (no `[plan]` block was ever streamed) the description doubles as
-    /// the panel's only step row.
-    fn parseStepMarker(self: *Tui, line: []const u8) bool {
-        var i: usize = "[step ".len;
-        var a: usize = 0;
-        var b: usize = 0;
-        while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) a = a * 10 + (line[i] - '0');
-        if (i >= line.len or line[i] != '/') return false;
-        i += 1;
-        while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) b = b * 10 + (line[i] - '0');
-        if (a == 0 or b == 0) return false;
-        if (!std.mem.startsWith(u8, line[i..], ": ")) return false;
-        const desc = std.mem.trimEnd(u8, line[i + 2 ..], "]");
-        self.plan_step_i = a;
-        self.plan_step_n = b;
-        self.plan_current_done = false;
-        self.plan_phase = .executing;
-        if (self.plan_steps.items.len < a) {
-            const copy = self.gpa.dupe(u8, desc) catch return true;
-            self.plan_steps.append(self.gpa, copy) catch self.gpa.free(copy);
+    /// Parses a raw `todo_write` result (header line + one item per
+    /// remaining line) into panel rows, replacing whatever was there —
+    /// `todo_write` always sends the full list, so there's never a partial
+    /// update to merge. Zero item lines (the "Todo list is now empty."
+    /// case) hides the panel. Called both from the marker capture above and
+    /// directly by `main.zig` at startup to hydrate from persisted memory.
+    pub fn setTodos(self: *Tui, raw: []const u8) void {
+        self.clearTodoLines();
+        self.todo_done = 0;
+        var lines = std.mem.splitScalar(u8, raw, '\n');
+        _ = lines.next(); // header line ("Todo list (N items):"), not shown in the panel
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const copy = self.gpa.dupe(u8, line) catch continue;
+            self.todo_lines.append(self.gpa, copy) catch {
+                self.gpa.free(copy);
+                continue;
+            };
+            if (std.mem.startsWith(u8, line, "\u{2713}")) self.todo_done += 1;
         }
-        return true;
-    }
-
-    /// Parses the captured `[plan]` block ("Plan:\n1. ...\n2. ...") into
-    /// per-step descriptions.
-    fn parsePlanBuf(self: *Tui) void {
-        self.clearPlanSteps();
-        var it = std.mem.splitScalar(u8, self.plan_buf.items, '\n');
-        while (it.next()) |ln| {
-            var i: usize = 0;
-            while (i < ln.len and ln[i] >= '0' and ln[i] <= '9') : (i += 1) {}
-            if (i == 0 or i >= ln.len or ln[i] != '.') continue;
-            var j = i + 1;
-            while (j < ln.len and ln[j] == ' ') : (j += 1) {}
-            if (j >= ln.len) continue;
-            const copy = self.gpa.dupe(u8, ln[j..]) catch continue;
-            self.plan_steps.append(self.gpa, copy) catch self.gpa.free(copy);
-        }
-    }
-
-    /// Hides the panel and drops all plan state; called when a turn ends.
-    /// A still-held filter line is flushed as content first (a turn should
-    /// never end mid-marker, but bytes must not vanish if it does).
-    fn resetPlanPanel(self: *Tui) void {
-        if (self.filter_line.items.len > 0) self.flushFilterLine();
-        self.capturing_plan = false;
-        self.plan_phase = .none;
-        self.clearPlanSteps();
-        self.plan_buf.clearRetainingCapacity();
-        self.plan_current_done = false;
-        self.plan_step_i = 0;
-        self.plan_step_n = 0;
+        self.todo_total = self.todo_lines.items.len;
     }
 
     /// Truncates `text` to at most `maxw` display columns, reserving one
@@ -1009,14 +949,16 @@ pub const Tui = struct {
         }
     }
 
-    /// The plan panel (between transcript and composer): an accent-guttered
-    /// block with a header row (`▍ plan 2/5`) and one row per step, glyphed
-    /// with the same status language as tool markers — ✓ done, ● running,
-    /// ○ pending. When steps outnumber the panel rows, the window follows
-    /// the current step (one completed step of context above it).
-    fn drawPlanPanel(self: *Tui) void {
-        if (self.panel_h == 0) return;
-        const first: u16 = self.rows - self.comp_h - self.panel_h;
+    /// The todo panel (between transcript and composer): an accent-guttered
+    /// block with a header row (`▍ todo 2/5`) and one row per item, colored
+    /// by each line's already-baked-in leading glyph — `todo_write` picked
+    /// ✓/●/○, this only maps glyph to theme color. When items outnumber the
+    /// panel rows, the overflow is summarized as a trailing "… N more" row
+    /// rather than windowed around a "current" item — todos aren't linear
+    /// the way plan-execute steps were (design doc §3.8).
+    fn drawTodoPanel(self: *Tui) void {
+        if (self.todo_panel_h == 0) return;
+        const first: u16 = self.rows - self.comp_h - self.todo_panel_h;
 
         self.writeFmt("\x1b[{d};1H", .{first});
         self.rawWrite("\x1b[2K");
@@ -1024,62 +966,51 @@ pub const Tui = struct {
         self.rawWrite("\u{258D}");
         self.rawWrite(self.theme.reset);
         self.rawWrite(self.theme.dim);
-        var hdr_buf: [64]u8 = undefined;
-        const header: []const u8 = switch (self.plan_phase) {
-            .none => "",
-            .planning => "planning\u{2026}",
-            .executing => blk: {
-                if (self.plan_step_i > 0 and self.plan_step_n > 0)
-                    break :blk std.fmt.bufPrint(&hdr_buf, "plan {d}/{d}", .{ self.plan_step_i, self.plan_step_n }) catch "plan";
-                if (self.plan_steps.items.len > 0)
-                    break :blk std.fmt.bufPrint(&hdr_buf, "plan \u{B7} {d} steps", .{self.plan_steps.items.len}) catch "plan";
-                break :blk "plan \u{B7} direct";
-            },
-            .synthesis => "plan \u{B7} synthesizing\u{2026}",
-        };
+        var hdr_buf: [32]u8 = undefined;
+        const header = std.fmt.bufPrint(&hdr_buf, "todo {d}/{d}", .{ self.todo_done, self.todo_total }) catch "todo";
         self.rawWrite(header);
         self.rawWrite(self.theme.reset);
 
-        const avail: usize = self.panel_h - 1;
-        const steps = self.plan_steps.items;
+        const avail: usize = self.todo_panel_h - 1;
+        const items = self.todo_lines.items;
         if (avail == 0) return;
-        var start: usize = 0;
-        if (steps.len > avail) {
-            const cur0: usize = if (self.plan_step_i > 0) self.plan_step_i - 1 else 0;
-            start = cur0 -| 1; // one done step of context above the current one
-            if (start > steps.len - avail) start = steps.len - avail;
-        }
+        const shown = @min(items.len, avail);
+        const overflow = items.len > avail;
+        // Reserve the last row for a "… N more" notice when truncated, so
+        // it's never silently cut off.
+        const item_rows: usize = if (overflow and shown > 0) shown - 1 else shown;
+
         var r: usize = 0;
-        while (r < avail) : (r += 1) {
+        while (r < item_rows) : (r += 1) {
             const term_row = first + 1 + @as(u16, @intCast(r));
             self.writeFmt("\x1b[{d};1H", .{term_row});
             self.rawWrite("\x1b[2K");
-            const idx = start + r;
-            if (idx >= steps.len) continue;
             self.rawWrite(self.theme.accent);
             self.rawWrite("\u{258D}");
             self.rawWrite(self.theme.reset);
-            const step_no = idx + 1;
-            const done = self.plan_phase == .synthesis or
-                step_no < self.plan_step_i or
-                (step_no == self.plan_step_i and self.plan_current_done);
-            const running = !done and step_no == self.plan_step_i;
-            if (done) {
-                self.rawWrite(self.theme.ok);
-                self.rawWrite("\u{2713} ");
-                self.rawWrite(self.theme.reset);
-            } else if (running) {
-                self.rawWrite(self.theme.warn);
-                self.rawWrite("\u{25CF} ");
-                self.rawWrite(self.theme.reset);
-            } else {
-                self.rawWrite(self.theme.dim);
-                self.rawWrite("\u{25CB} ");
-                self.rawWrite(self.theme.reset);
-            }
-            if (!running) self.rawWrite(self.theme.dim);
-            self.writeTruncated(steps[idx], @as(usize, self.cols) -| 3);
-            if (!running) self.rawWrite(self.theme.reset);
+            const line = items[r];
+            const color = if (std.mem.startsWith(u8, line, "\u{2713}"))
+                self.theme.ok
+            else if (std.mem.startsWith(u8, line, "\u{25CF}"))
+                self.theme.warn
+            else
+                self.theme.dim;
+            self.rawWrite(color);
+            self.writeTruncated(line, @as(usize, self.cols) -| 3);
+            self.rawWrite(self.theme.reset);
+        }
+        if (overflow) {
+            const term_row = first + 1 + @as(u16, @intCast(item_rows));
+            self.writeFmt("\x1b[{d};1H", .{term_row});
+            self.rawWrite("\x1b[2K");
+            self.rawWrite(self.theme.accent);
+            self.rawWrite("\u{258D}");
+            self.rawWrite(self.theme.reset);
+            self.rawWrite(self.theme.dim);
+            var more_buf: [32]u8 = undefined;
+            const more = std.fmt.bufPrint(&more_buf, "\u{2026} {d} more", .{items.len - item_rows}) catch "\u{2026} more";
+            self.rawWrite(more);
+            self.rawWrite(self.theme.reset);
         }
     }
 
@@ -1207,13 +1138,7 @@ pub const Tui = struct {
 
         // Right side: [style] · model · session, dropping pieces to fit.
         var right_buf: [128]u8 = undefined;
-        var style_buf: [24]u8 = undefined;
-        const style_tag: []const u8 = if (!self.plan_execute)
-            "[react]"
-        else if (self.plan_step_n > 0)
-            std.fmt.bufPrint(&style_buf, "[plan {d}/{d}]", .{ self.plan_step_i, self.plan_step_n }) catch "[plan]"
-        else
-            "[plan]";
+        const style_tag: []const u8 = if (self.todo_mode) "[todo]" else "[react]";
 
         const left_w = displayWidth(left);
         var right: []const u8 = "";
@@ -1258,7 +1183,7 @@ pub const Tui = struct {
         "Ctrl+W / U    delete word / clear input",
         "PgUp PgDn     scroll transcript (wheel too)",
         "Esc           cancel turn \u{B7} jump tail \u{B7} clear",
-        "Ctrl+P        toggle react / plan style",
+        "Ctrl+P        toggle react / todo style",
         "Ctrl+L        redraw screen",
         "Ctrl+Z        suspend",
         "Ctrl+G        toggle this help",
@@ -1344,12 +1269,8 @@ pub const Tui = struct {
         self.renderAll();
     }
 
-    pub fn setStyle(self: *Tui, plan_execute: bool) void {
-        self.plan_execute = plan_execute;
-        if (!plan_execute) {
-            self.plan_step_i = 0;
-            self.plan_step_n = 0;
-        }
+    pub fn setStyle(self: *Tui, todo_mode: bool) void {
+        self.todo_mode = todo_mode;
         self.drawBar();
         if (!self.help_visible) self.positionCursor();
     }
@@ -1427,7 +1348,6 @@ pub const Tui = struct {
         self.rewrapTail();
         self.busy = false;
         self.cancelling = false;
-        self.resetPlanPanel();
         self.renderAll();
     }
 
@@ -1879,73 +1799,7 @@ test "error span: agent error markers produce err-guttered rows" {
     try testing.expect(saw_none);
 }
 
-test "plan panel: [step i/n] markers update progress and are suppressed from the transcript" {
-    var ui = try testTui();
-    defer closeTui(&ui);
-
-    ui.appendOutput("\n[step 2/4: do the thing]\n");
-    try testing.expectEqual(@as(usize, 2), ui.plan_step_i);
-    try testing.expectEqual(@as(usize, 4), ui.plan_step_n);
-    try testing.expect(ui.plan_phase == .executing);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[step") == null);
-    // Degrade path: no [plan] block streamed, so the step description
-    // seeds the panel's step list.
-    try testing.expectEqual(@as(usize, 1), ui.plan_steps.items.len);
-    try testing.expectEqualStrings("do the thing", ui.plan_steps.items[0]);
-}
-
-test "plan panel: [plan] block is diverted out of the transcript and parsed into steps" {
-    var ui = try testTui();
-    defer closeTui(&ui);
-
-    ui.appendOutput("\n[planning...]\n");
-    try testing.expect(ui.plan_phase == .planning);
-
-    ui.appendOutput("\n[plan]\nPlan:\n1. check the cronjob\n2. describe the node\n[/plan]\n");
-    try testing.expect(ui.plan_phase == .executing);
-    try testing.expectEqual(@as(usize, 2), ui.plan_steps.items.len);
-    try testing.expectEqualStrings("check the cronjob", ui.plan_steps.items[0]);
-    try testing.expectEqualStrings("describe the node", ui.plan_steps.items[1]);
-    // None of it reached the chat view.
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "Plan:") == null);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "cronjob") == null);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[plan]") == null);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[planning") == null);
-
-    // Step lifecycle: running → done → synthesis.
-    ui.appendOutput("\n[step 1/2: check the cronjob]\nstep output here\n[/step 1/2]\n");
-    try testing.expectEqual(@as(usize, 1), ui.plan_step_i);
-    try testing.expect(ui.plan_current_done);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "step output here") != null);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[/step") == null);
-
-    ui.appendOutput("\n[synthesis]\nfinal answer\n[/synthesis]\n");
-    try testing.expect(ui.plan_phase == .synthesis);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "final answer") != null);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[synthesis]") == null);
-
-    // Turn end hides the panel and drops the state.
-    ui.onAgentDone();
-    try testing.expect(ui.plan_phase == .none);
-    try testing.expectEqual(@as(usize, 0), ui.plan_steps.items.len);
-}
-
-test "plan panel: markers split across arbitrary chunk boundaries still parse" {
-    var ui = try testTui();
-    defer closeTui(&ui);
-
-    const stream = "\n[plan]\nPlan:\n1. alpha\n2. beta\n[/plan]\n\n[step 1/2: alpha]\nout\n";
-    // Worst case: one byte per channel drain.
-    for (stream) |b| ui.appendOutput(&[_]u8{b});
-
-    try testing.expectEqual(@as(usize, 2), ui.plan_steps.items.len);
-    try testing.expectEqualStrings("alpha", ui.plan_steps.items[0]);
-    try testing.expectEqual(@as(usize, 1), ui.plan_step_i);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "Plan:") == null);
-    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "out") != null);
-}
-
-test "plan panel: bracket lookalikes flow through to the transcript untouched" {
+test "processStream: bracketed content flows through to the transcript untouched" {
     var ui = try testTui();
     defer closeTui(&ui);
 
@@ -1954,7 +1808,58 @@ test "plan panel: bracket lookalikes flow through to the transcript untouched" {
     try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[cancelled]") != null);
     try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[plans are nice]") != null);
     try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[step without numbers]") != null);
-    try testing.expect(ui.plan_phase == .none);
+}
+
+test "todo panel: [todos]/[/todos] block is diverted out of the transcript and parsed into rows" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    ui.appendOutput("\n[todos]\nTodo list (2 items):\n\u{2713} a\n\u{25CB} b\n[/todos]\n");
+
+    try testing.expectEqual(@as(usize, 2), ui.todo_lines.items.len);
+    try testing.expectEqual(@as(usize, 1), ui.todo_done);
+    try testing.expectEqual(@as(usize, 2), ui.todo_total);
+    try testing.expectEqualStrings("\u{2713} a", ui.todo_lines.items[0]);
+    try testing.expectEqualStrings("\u{25CB} b", ui.todo_lines.items[1]);
+    // None of it reached the chat view.
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "Todo list") == null);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "[todos]") == null);
+}
+
+test "todo panel: markers split across arbitrary chunk boundaries still parse" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    const stream = "\n[todos]\nTodo list (1 items):\n\u{25CF} in progress\n[/todos]\n";
+    // Worst case: one byte per channel drain.
+    for (stream) |b| ui.appendOutput(&[_]u8{b});
+
+    try testing.expectEqual(@as(usize, 1), ui.todo_lines.items.len);
+    try testing.expectEqualStrings("\u{25CF} in progress", ui.todo_lines.items[0]);
+    try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "Todo list") == null);
+}
+
+test "todo panel: an empty list hides the panel, a non-empty one shows it" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    ui.appendOutput("\n[todos]\nTodo list (1 items):\n\u{25CB} step one\n[/todos]\n");
+    try testing.expect(ui.todoPanelHeight() > 0);
+
+    ui.appendOutput("\n[todos]\nTodo list is now empty.\n[/todos]\n");
+    try testing.expectEqual(@as(usize, 0), ui.todo_lines.items.len);
+    try testing.expectEqual(@as(u16, 0), ui.todoPanelHeight());
+}
+
+test "todo panel: survives onAgentDone — unlike the old plan panel, it is not turn-scoped" {
+    var ui = try testTui();
+    defer closeTui(&ui);
+
+    ui.appendOutput("\n[todos]\nTodo list (1 items):\n\u{25CB} still going\n[/todos]\n");
+    ui.onAgentDone();
+
+    try testing.expectEqual(@as(usize, 1), ui.todo_lines.items.len);
+    try testing.expectEqualStrings("\u{25CB} still going", ui.todo_lines.items[0]);
 }
 
 test "frame: pinned 80x24 render carries transcript, prompt, and bar" {
@@ -1997,7 +1902,7 @@ test "frame: pinned 80x24 render carries transcript, prompt, and bar" {
     try testing.expect(std.mem.indexOf(u8, frame.items, "\x1b[24;1H") != null); // bar on the last row
 }
 
-test "frame: plan panel renders above the composer with status glyphs" {
+test "frame: todo panel renders above the composer with a done/total header and glyph colors" {
     var pipe_fds: [2]posix.fd_t = undefined;
     if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
     defer _ = std.c.close(pipe_fds[0]);
@@ -2010,7 +1915,7 @@ test "frame: plan panel renders above the composer with status glyphs" {
         _ = std.c.close(pipe_fds[1]);
     }
 
-    ui.appendOutput("\n[plan]\nPlan:\n1. first task\n2. second task\n[/plan]\n\n[step 1/2: first task]\n");
+    ui.appendOutput("\n[todos]\nTodo list (2 items):\n\u{2713} first task\n\u{25CB} second task\n[/todos]\n");
 
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(testing.allocator);
@@ -2022,17 +1927,15 @@ test "frame: plan panel renders above the composer with status glyphs" {
     }
 
     // Panel sits directly above the 1-row composer at 80×24: header on row
-    // 20, steps on 21-22, composer row 23, bar row 24.
-    try testing.expect(std.mem.indexOf(u8, frame.items, "plan 1/2") != null);
+    // 20, items on 21-22, composer row 23, bar row 24.
+    try testing.expect(std.mem.indexOf(u8, frame.items, "todo 1/2") != null);
     try testing.expect(std.mem.indexOf(u8, frame.items, "\u{258D}") != null); // panel gutter
-    // Running: warn "● " + reset, then the undimmed description.
-    try testing.expect(std.mem.indexOf(u8, frame.items, "\u{25CF} \x1b[0mfirst task") != null);
-    // Pending: dim "○ " + reset, then the dimmed description.
-    try testing.expect(std.mem.indexOf(u8, frame.items, "\u{25CB} \x1b[0m\x1b[2msecond task") != null);
+    // Done: green "✓" ahead of the item text.
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\u{2713} first task") != null);
     try testing.expect(std.mem.indexOf(u8, frame.items, "\x1b[20;1H") != null); // header row position
-    // The plan text never rendered inside the transcript viewport (its
+    // The list text never rendered inside the transcript viewport (its
     // only occurrences are the panel rows 20-22).
-    try testing.expect(std.mem.indexOf(u8, frame.items, "Plan:") == null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "Todo list") == null);
 }
 
 test "NO_COLOR: rendered output contains no SGR sequences" {

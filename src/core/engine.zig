@@ -3,13 +3,11 @@ const Io = std.Io;
 const message = @import("message.zig");
 const tool = @import("tool.zig");
 const memory = @import("memory.zig");
-const plan = @import("plan.zig");
 const hook = @import("hook.zig");
 const Message = message.Message;
 const assert = std.debug.assert;
 
-/// Circuit breaker for the self-healing loop (design doc §3.3). Also used
-/// as the planning-attempt budget in the Plan-and-Execute style (§3.5).
+/// Circuit breaker for the self-healing loop (design doc §3.3).
 pub const max_retries: usize = 3;
 
 /// Result of one `Engine.step` call.
@@ -26,11 +24,10 @@ pub const Outcome = union(enum) {
     cancelled,
 };
 
-/// Orchestration style, selectable at runtime (CLI flag + TUI toggle — see
-/// design doc §3). `enum(u8)`, not a bare `enum`: `Engine.style` below is
-/// `std.atomic.Value(Style)`, and `std.atomic.Value(T)` is an `extern
-/// struct { raw: T }`, which rejects an inferred-tag enum at compile time.
-pub const Style = enum(u8) { react, plan_execute };
+/// Re-exported from `hook.zig` (its canonical home — see that file's doc
+/// comment) so existing `engine.Style` references throughout this codebase
+/// keep working unchanged.
+pub const Style = hook.Style;
 
 /// Byte-length-identical (12 bytes: `ESC [ NN m` + a 3-byte UTF-8 glyph +
 /// `ESC [ 0 m`) SGR-wrapped status markers for the tool-call line
@@ -83,8 +80,8 @@ fn oneLine(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// Builds an orchestrator (ReAct or Plan-and-Execute, §3) over a fixed,
-/// comptime-known set of tools and a duck-typed LLM `Provider`. `Tools` is
+/// Builds a ReAct orchestrator (§3) over a fixed, comptime-known set of
+/// tools and a duck-typed LLM `Provider`. `Tools` is
 /// a tuple of tool types (see `core/tool.zig` for the contract); `Provider`
 /// is any type exposing:
 ///
@@ -129,12 +126,12 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
         /// must stay atomic, same convention as `io_bus.AgentState.thinking`.
         style: std.atomic.Value(Style) = .init(.react),
         /// Cooperative cancellation flag (§3.4), set from another thread
-        /// via `requestCancel` while a turn is running. Checked at loop
-        /// boundaries only — before each provider call, between plan
-        /// steps, and between planning attempts — never mid-HTTP-stream,
-        /// so a cancel takes effect at the next boundary rather than
-        /// instantly. Cleared at the start of every `step()` so a cancel
-        /// that lands after a turn already finished can't kill the next one.
+        /// via `requestCancel` while a turn is running. Checked only at the
+        /// top of `runToolLoop`'s loop — before each provider call — never
+        /// mid-HTTP-stream, so a cancel takes effect at the next boundary
+        /// rather than instantly. Cleared at the start of every `step()` so
+        /// a cancel that lands after a turn already finished can't kill the
+        /// next one.
         cancel_requested: std.atomic.Value(bool) = .init(false),
 
         pub fn init(gpa: std.mem.Allocator, io: Io, provider: *Provider, mem: *memory.Memory) Self {
@@ -211,18 +208,14 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
             return oneLine(self.gpa, raw);
         }
 
-        /// Runs one user turn under whichever orchestration style is
-        /// currently selected (`setStyle`, default ReAct).
+        /// Runs one user turn (ReAct, §3.1-3.3). `writer`, if non-null,
+        /// receives streaming content tokens from the provider and
+        /// tool-dispatch progress lines as they happen.
         ///
-        /// `writer`, if non-null, receives streaming content tokens from the
-        /// provider and tool-dispatch progress lines as they happen.
-        ///
-        /// The single entry point both styles funnel through, so the
-        /// `onTurnStart`/`onTurnEnd` hooks fire exactly once per
-        /// user-facing turn regardless of style. The turn arena exists
-        /// because these two hooks need a `Ctx.scratch`, and
-        /// `runToolLoop`'s `loop_arena` doesn't exist yet at turn start
-        /// and is already gone by turn end.
+        /// The `onTurnStart`/`onTurnEnd` hooks fire exactly once per
+        /// user-facing turn. The turn arena exists because these two hooks
+        /// need a `Ctx.scratch`, and `runToolLoop`'s `loop_arena` doesn't
+        /// exist yet at turn start and is already gone by turn end.
         pub fn step(self: *Self, user_text: ?[]const u8, writer: ?*Io.Writer) !Outcome {
             self.cancel_requested.store(false, .monotonic);
             var turn_arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -231,6 +224,7 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
                 .gpa = self.gpa,
                 .scratch = turn_arena.allocator(),
                 .writer = writer,
+                .style = self.style.load(.acquire),
             };
 
             var text = user_text;
@@ -244,10 +238,7 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
             }
 
             const mem_count_turn_start = self.mem.items().len;
-            const outcome = switch (self.style.load(.acquire)) {
-                .react => try self.stepReact(text, writer),
-                .plan_execute => try self.stepPlanExecute(text, writer),
-            };
+            const outcome = try self.stepReact(text, writer);
             // Paired prune-semantics invariants (§3.3): a completed turn
             // only ever grows memory; an escalated turn prunes back to at
             // most [user_message, system_note] past the turn boundary. A
@@ -276,258 +267,31 @@ pub fn Engine(comptime Tools: anytype, comptime Provider: type, comptime Hooks: 
             // Known-good boundary: if we have to escalate, everything from
             // here onward (this turn's malformed attempts) gets pruned.
             const turn_start = self.mem.items().len;
-            return self.runToolLoop(turn_start, writer, self.mem.items());
-        }
-
-        /// Runs the Plan-and-Execute loop (design doc §3.5) for one user
-        /// turn: builds a static plan via an ephemeral (never persisted)
-        /// planning exchange, executes each step via the shared
-        /// `runToolLoop`, then issues one more call to synthesize a final
-        /// answer from all the step results.
-        ///
-        /// Escalation from planning-instruction execution or any step
-        /// shares the same `turn_start` as the whole turn, so a failure
-        /// anywhere prunes the entire plan-execute turn (plan included)
-        /// back to `[user_message, system_note]` — identical semantics to
-        /// ReAct's escalation, and a deliberate v1 trade-off: a late-step
-        /// failure discards earlier successful steps' work too, consistent
-        /// with the "static plan, no dynamic replanning" design choice.
-        fn stepPlanExecute(self: *Self, user_text: ?[]const u8, writer: ?*Io.Writer) !Outcome {
-            if (user_text) |t| try self.mem.append(Message.user(t));
-            const turn_start = self.mem.items().len;
-
-            // Owns everything built during planning AND step execution —
-            // created once here (not inside buildPlan) so a returned Plan's
-            // strings stay valid through the step-execution loop below, not
-            // just through buildPlan itself.
-            var scratch_arena = std.heap.ArenaAllocator.init(self.gpa);
-            defer scratch_arena.deinit();
-            const scratch = scratch_arena.allocator();
-
-            if (writer) |w| {
-                try w.writeAll("\n[planning...]\n");
-                try w.flush();
-            }
-
-            const maybe_plan = try self.buildPlan(scratch);
-
-            // A cancel during planning must not fall through into the
-            // single-step degrade path and execute anyway (§3.4).
-            if (self.cancelPending()) return self.finishCancelled(writer);
-
-            const steps: []const plan.PlanStep = if (maybe_plan) |p| p.steps else blk: {
-                if (writer) |w| {
-                    try w.writeAll("[plan unavailable, proceeding directly]\n");
-                    try w.flush();
-                }
-                const single = try scratch.alloc(plan.PlanStep, 1);
-                single[0] = .{ .description = user_text orelse "" };
-                break :blk single;
-            };
-
-            // Built once and shown to the user inside explicit [plan]/[/plan]
-            // markers — same bracket convention as the existing [-> tool]/
-            // [<- result] progress markers — so the whole plan is visible
-            // before any step runs, and any consumer reading the stream
-            // (TUI today, something else later) can find the boundary
-            // unambiguously rather than inferring it from "until the next
-            // marker shows up." Also persisted so the LLM sees it on every
-            // later step.
-            var summary: std.ArrayList(u8) = .empty;
-            try summary.appendSlice(scratch, "Plan:\n");
-            for (steps, 0..) |s, i| try summary.print(scratch, "{d}. {s}\n", .{ i + 1, s.description });
-            if (writer) |w| {
-                try w.writeAll("\n[plan]\n");
-                try w.writeAll(summary.items);
-                try w.writeAll("[/plan]\n");
-                try w.flush();
-            }
-            if (maybe_plan != null) try self.mem.append(Message.system(summary.items));
-
-            // Without this, each step's instruction reads to the LLM like a
-            // fresh user message — it responds conversationally (asks
-            // whether to continue, re-writes a full report every step)
-            // instead of executing the plan autonomously.
-            const policy_note = "You will now execute the plan above automatically, one step " ++
-                "at a time, without asking the user whether to continue. The next " ++
-                "step runs automatically; a complete, user-facing report is " ++
-                "written once, automatically, after the final step.";
-            try self.mem.append(Message.system(policy_note));
-
-            // Curated context shared by every step: prior conversation
-            // turns (unaffected) plus the plan and policy note, growing
-            // with each *completed* step's own reply as we go — not that
-            // step's raw tool-call/tool-result transcript. A step's LLM
-            // call therefore never sees an earlier step's full back-and-
-            // forth with the tool layer, only "what happened" — which is
-            // what stops a later step from being misled by (or blindly
-            // imitating the chat-turn shape of) an earlier step's full
-            // reply. Nothing is lost: `self.mem` still has the raw
-            // transcript for the audit log and for the synthesis call
-            // below, which intentionally does see everything.
-            var curated: std.ArrayList(Message) = .empty;
-            try curated.appendSlice(scratch, self.mem.items()[0..turn_start]);
-            try curated.append(scratch, Message.system(summary.items));
-            try curated.append(scratch, Message.system(policy_note));
-
-            for (steps, 0..) |s, i| {
-                // Between steps: bail before persisting the next step's
-                // instruction, so a cancelled turn doesn't leave a dangling
-                // never-executed instruction in memory (§3.4).
-                if (self.cancelPending()) return self.finishCancelled(writer);
-
-                if (writer) |w| {
-                    try w.print("\n[step {d}/{d}: {s}]\n", .{ i + 1, steps.len, s.description });
-                    try w.flush();
-                }
-                var instr: std.ArrayList(u8) = .empty;
-                try instr.print(scratch, "Execute step {d} of {d} now, using tools as needed: {s}\n" ++
-                    "Reply with only a brief status — no headers, no full report, no asking to continue.", .{ i + 1, steps.len, s.description });
-                try self.mem.append(Message.system(instr.items));
-
-                var step_view: std.ArrayList(Message) = .empty;
-                try step_view.appendSlice(scratch, curated.items);
-                try step_view.append(scratch, Message.system(instr.items));
-
-                const outcome = try self.runToolLoop(turn_start, writer, step_view.items);
-
-                if (writer) |w| {
-                    try w.print("[/step {d}/{d}]\n", .{ i + 1, steps.len });
-                    try w.flush();
-                }
-
-                if (outcome != .final) return outcome; // .escalated or .cancelled
-
-                // Fold this step's own reply into the curated view for the
-                // *next* step — not its raw tool-call transcript.
-                var summary_line: std.ArrayList(u8) = .empty;
-                try summary_line.print(scratch, "Step {d} ({s}): {s}", .{ i + 1, s.description, outcome.final });
-                try curated.append(scratch, Message.system(summary_line.items));
-            }
-
-            try self.mem.append(Message.system(
-                "All plan steps are complete. Write one cohesive final answer to " ++
-                    "the user's original request, incorporating the results above.",
-            ));
-            if (writer) |w| {
-                try w.writeAll("\n[synthesis]\n");
-                try w.flush();
-            }
-            // Synthesis is the one call that should see everything, not the
-            // curated view — pass the full, real history.
-            const final_outcome = try self.runToolLoop(turn_start, writer, self.mem.items());
-            if (writer) |w| {
-                try w.writeAll("[/synthesis]\n");
-                try w.flush();
-            }
-            return final_outcome;
-        }
-
-        /// Builds a static plan via an ephemeral (never persisted to
-        /// `self.mem`) planning exchange. `arena` must outlive the caller's
-        /// use of the returned `Plan`'s strings (it's the same arena passed
-        /// through to `stepPlanExecute`'s step-execution loop). Returns
-        /// `null` (graceful degrade, not an error) if the LLM never
-        /// produces parseable plan JSON within `max_retries + 1` attempts —
-        /// planning failure isn't a tool failure and shouldn't
-        /// escalate/prune the turn.
-        fn buildPlan(self: *Self, arena: std.mem.Allocator) !?plan.Plan {
-            var ephemeral: std.ArrayList(Message) = .empty;
-            try ephemeral.appendSlice(arena, self.mem.items());
-            try ephemeral.append(arena, Message.system(plan.schema_prompt));
-
-            // Only `preLlm` runs during planning; `postLlm` is deliberately
-            // not honored here (docs/feat/hooks.MD, "Documented
-            // limitations"): a plan reply is parsed as JSON immediately,
-            // and a hook silently corrupting it degrades ungracefully.
-            // `writer` is null because the planning exchange never streams.
-            const ctx: hook.Ctx = .{
-                .gpa = self.gpa,
-                .scratch = arena,
-                .writer = null,
-            };
-            _ = &ctx;
-
-            var attempt: usize = 0;
-            while (attempt <= max_retries) : (attempt += 1) {
-                // A cancel lands as "no plan"; stepPlanExecute re-checks the
-                // flag right after this returns and bails before the
-                // single-step degrade path can run anything (§3.4).
-                if (self.cancelPending()) return null;
-
-                inline for (Hooks) |H| {
-                    if (@hasDecl(H, "preLlm")) try H.preLlm(ctx, &ephemeral);
-                }
-                const reply = try self.provider.chat(self.gpa, self.io, ephemeral.items, &.{}, null);
-                // Dupe into `arena` BEFORE freeing `reply`:
-                // parseFromSliceLeaky's default `.alloc_if_needed` can alias
-                // directly into the input buffer for strings that don't
-                // need unescaping, which would otherwise leave
-                // Plan.steps[].description dangling once `reply` is freed
-                // below.
-                const owned_content = try arena.dupe(u8, reply.content);
-                freeReply(self.gpa, reply);
-
-                const candidate = plan.stripCodeFence(owned_content);
-                const parsed = std.json.parseFromSliceLeaky(plan.Plan, arena, candidate, .{
-                    .ignore_unknown_fields = true,
-                    .allocate = .alloc_always, // belt-and-suspenders on top of the dupe above
-                }) catch |err| {
-                    try ephemeral.append(arena, .{ .role = .assistant, .content = owned_content });
-                    var note: std.ArrayList(u8) = .empty;
-                    try note.print(arena, "That was not valid JSON matching {{\"steps\":[{{\"description\":\"...\"}}]}}: {s}\n" ++
-                        "Respond again with ONLY the corrected JSON object, nothing else.", .{@errorName(err)});
-                    try ephemeral.append(arena, Message.system(note.items));
-                    continue;
-                };
-                if (parsed.steps.len == 0) {
-                    try ephemeral.append(arena, .{ .role = .assistant, .content = owned_content });
-                    try ephemeral.append(arena, Message.system(
-                        "The \"steps\" array must not be empty. Respond again with ONLY the corrected JSON object, nothing else.",
-                    ));
-                    continue;
-                }
-                return parsed;
-            }
-            return null;
+            return self.runToolLoop(turn_start, writer);
         }
 
         /// Runs one provider-call/tool-dispatch/self-healing cycle to
-        /// completion — either a final text answer or an escalation.
-        /// Shared by both orchestration styles: ReAct calls it once per
-        /// turn, Plan-and-Execute calls it once per plan step plus once
-        /// more for the final synthesis, all against the same `turn_start`
-        /// so an escalation anywhere in a plan-execute turn prunes the
-        /// whole turn the same way ReAct prunes a single failed turn.
-        ///
-        /// `base_view` is what gets sent to the provider on the first call
-        /// of this loop — NOT necessarily `self.mem.items()`. ReAct passes
-        /// the full shared history (unchanged behavior); Plan-and-Execute
-        /// passes a curated, per-step view (design doc §3.5) so a step's
-        /// LLM call doesn't see every earlier step's raw tool-call
-        /// transcript. Regardless of `base_view`, every message this loop
-        /// produces is still persisted to `self.mem` exactly as before —
-        /// only what's *sent to the provider* diverges, not what's kept
-        /// for the audit log / escalation pruning / later synthesis.
-        fn runToolLoop(self: *Self, turn_start: usize, writer: ?*Io.Writer, base_view: []const Message) !Outcome {
+        /// completion — either a final text answer or an escalation. Called
+        /// once per turn by `stepReact`, against `self.mem.items()` as it
+        /// stood at `turn_start`.
+        fn runToolLoop(self: *Self, turn_start: usize, writer: ?*Io.Writer) !Outcome {
             assert(turn_start <= self.mem.items().len);
             var retries: usize = 0;
 
             // Grows as tool calls happen within this loop, seeded from
-            // `base_view`, so the model keeps seeing its own tool calls and
-            // their results across iterations — but starting from whatever
-            // curated (or full) view the caller chose, not necessarily
-            // `self.mem`.
+            // `self.mem`, so the model keeps seeing its own tool calls and
+            // their results across iterations.
             var loop_arena = std.heap.ArenaAllocator.init(self.gpa);
             defer loop_arena.deinit();
             const scratch = loop_arena.allocator();
             var view: std.ArrayList(Message) = .empty;
-            try view.appendSlice(scratch, base_view);
+            try view.appendSlice(scratch, self.mem.items());
 
             const ctx: hook.Ctx = .{
                 .gpa = self.gpa,
                 .scratch = scratch,
                 .writer = writer,
+                .style = self.style.load(.acquire),
             };
 
             while (true) {
@@ -982,91 +746,6 @@ test "step: requestCancel stops the turn at the next loop boundary and records a
     try testing.expect(std.mem.indexOf(u8, bytes, "should not appear") == null);
 }
 
-test "step (plan-execute): happy path executes a plan then synthesizes a final answer" {
-    const calc_call = message.ToolCall{
-        .id = "call_1",
-        .name = "calculator",
-        .arguments_json = "{\"op\":\"add\",\"a\":2,\"b\":3}",
-    };
-    var counts: std.ArrayList(usize) = .empty;
-    defer counts.deinit(testing.allocator);
-    var mock: llm.Mock = .{ .call_message_counts = &counts, .script = &.{
-        .{ .role = .assistant, .content = "{\"steps\":[{\"description\":\"first\"},{\"description\":\"second\"}]}" },
-        .{ .role = .assistant, .tool_calls = &.{calc_call} },
-        .{ .role = .assistant, .content = "Step 1 done." },
-        .{ .role = .assistant, .tool_calls = &.{calc_call} },
-        .{ .role = .assistant, .content = "Step 2 done." },
-        .{ .role = .assistant, .content = "Final synthesized answer." },
-    } };
-
-    const path = "/tmp/mymew_test_plan_happy.jsonl";
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
-
-    var mem = try memory.Memory.init(testing.allocator, io, path);
-    defer mem.deinit();
-
-    var eng = Engine(TestTools, llm.Mock, .{}).init(testing.allocator, io, &mock, &mem);
-    eng.setStyle(.plan_execute);
-    const outcome = try eng.step("do a two-step task", null);
-
-    try testing.expect(outcome == .final);
-    try testing.expectEqualStrings("Final synthesized answer.", outcome.final);
-
-    // Proves context curation is actually happening, not just trusted:
-    // planning(2) -> step1 call1(4) -> step1 call2(6) -> step2 call1(5) ->
-    // step2 call2(7) -> synthesis(12). Step 2's calls (5, 7) start from the
-    // curated view (user + plan + policy + step1's one-line summary + this
-    // step's instruction, then its own tool exchange) — NOT from step 1's
-    // raw tool-call/tool-result transcript, which would have made step 2's
-    // first call 8 messages (mem's length at that point) instead of 5. Only
-    // the final synthesis call (12) sees the full raw history.
-    try testing.expectEqualSlices(usize, &.{ 2, 4, 6, 5, 7, 12 }, counts.items);
-    // user + plan-summary + autonomous-execution-policy + 2x[step-instr,
-    // assistant-toolcall, tool-result, assistant-final] + synthesis-instr +
-    // assistant-final
-    try testing.expectEqual(@as(usize, 13), mem.items().len);
-}
-
-test "step (plan-execute): degrades to a single step when the planner never returns valid JSON" {
-    const calc_call = message.ToolCall{
-        .id = "call_1",
-        .name = "calculator",
-        .arguments_json = "{\"op\":\"add\",\"a\":2,\"b\":3}",
-    };
-    var mock: llm.Mock = .{ .script = &.{
-        .{ .role = .assistant, .content = "not json" },
-        .{ .role = .assistant, .content = "not json" },
-        .{ .role = .assistant, .content = "not json" },
-        .{ .role = .assistant, .content = "not json" },
-        .{ .role = .assistant, .tool_calls = &.{calc_call} },
-        .{ .role = .assistant, .content = "Step done." },
-        .{ .role = .assistant, .content = "Final synthesized answer." },
-    } };
-
-    const path = "/tmp/mymew_test_plan_degrade.jsonl";
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
-
-    var mem = try memory.Memory.init(testing.allocator, io, path);
-    defer mem.deinit();
-
-    var eng = Engine(TestTools, llm.Mock, .{}).init(testing.allocator, io, &mock, &mem);
-    eng.setStyle(.plan_execute);
-    const outcome = try eng.step("do something the planner can't parse", null);
-
-    try testing.expect(outcome == .final);
-    try testing.expectEqualStrings("Final synthesized answer.", outcome.final);
-    // user + autonomous-execution-policy (no plan-summary in the degrade
-    // case) + [step-instr, assistant-toolcall, tool-result, assistant-final]
-    // + synthesis-instr + assistant-final
-    try testing.expectEqual(@as(usize, 8), mem.items().len);
-}
-
 test "hooks: preTool veto skips dispatch and feeds the veto back as the tool result" {
     const VetoHook = struct {
         pub fn name() []const u8 {
@@ -1377,36 +1056,3 @@ test "hooks: onTurnEnd observes the outcome and onEscalate can replace the repor
     try testing.expect(ObserverHook.saw_escalated);
 }
 
-test "step (plan-execute): escalates and prunes the whole turn when a step's tool call keeps failing" {
-    const bad_call = message.ToolCall{
-        .id = "call_x",
-        .name = "calculator",
-        .arguments_json = "{\"op\":\"add\",\"a\":\"NOT_A_NUMBER\"}",
-    };
-    var mock: llm.Mock = .{ .script = &.{
-        .{ .role = .assistant, .content = "{\"steps\":[{\"description\":\"do the bad thing\"}]}" },
-        .{ .role = .assistant, .tool_calls = &.{bad_call} },
-        .{ .role = .assistant, .tool_calls = &.{bad_call} },
-        .{ .role = .assistant, .tool_calls = &.{bad_call} },
-        .{ .role = .assistant, .tool_calls = &.{bad_call} },
-    } };
-
-    const path = "/tmp/mymew_test_plan_escalate.jsonl";
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
-
-    var mem = try memory.Memory.init(testing.allocator, io, path);
-    defer mem.deinit();
-
-    var eng = Engine(TestTools, llm.Mock, .{}).init(testing.allocator, io, &mock, &mem);
-    eng.setStyle(.plan_execute);
-    const outcome = try eng.step("compute something that will keep failing", null);
-    defer testing.allocator.free(outcome.escalated);
-
-    try testing.expect(outcome == .escalated);
-    try testing.expectEqual(@as(usize, 2), mem.items().len);
-    try testing.expectEqual(message.Role.user, mem.items()[0].role);
-    try testing.expectEqual(message.Role.system, mem.items()[1].role);
-}

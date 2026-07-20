@@ -27,14 +27,17 @@ const read_file = @import("plugins/tools/read_file.zig");
 const write_file = @import("plugins/tools/write_file.zig");
 const list_files = @import("plugins/tools/list_files.zig");
 const execute_command = @import("plugins/tools/execute_command.zig");
+const todo_write = @import("plugins/tools/todo_write.zig");
 const tool_audit_log = @import("plugins/hooks/tool_audit_log.zig");
+const todo_tracker = @import("plugins/hooks/todo_tracker.zig");
 const tui_mod = @import("tui/app.zig");
 
-const Tools = .{ calculator, word_count, read_file, write_file, list_files, execute_command };
+const Tools = .{ calculator, word_count, read_file, write_file, list_files, execute_command, todo_write };
 // Interceptor hooks (core/hook.zig, design doc §3.7) fire in tuple order.
 // `tool_audit_log` is the observe-only sample hook the design shipped
-// with; drop it from this tuple to silence the audit lines.
-const Hooks = .{tool_audit_log};
+// with; drop it from this tuple to silence the audit lines. `todo_tracker`
+// pairs with the `todo_write` tool above (design doc §3.8).
+const Hooks = .{ tool_audit_log, todo_tracker };
 const Agent = agent_mod.Agent(Tools, llm.Glm, Hooks);
 
 // `zig build test` walks the whole `@import` graph for source, but Zig
@@ -45,9 +48,11 @@ const Agent = agent_mod.Agent(Tools, llm.Glm, Hooks);
 // add a line here whenever a new such module is introduced.
 test {
     std.testing.refAllDecls(@import("core/engine.zig"));
-    std.testing.refAllDecls(@import("core/plan.zig"));
     std.testing.refAllDecls(@import("core/hook.zig"));
+    std.testing.refAllDecls(@import("core/tool.zig"));
+    std.testing.refAllDecls(@import("plugins/tools/todo_write.zig"));
     std.testing.refAllDecls(@import("plugins/hooks/tool_audit_log.zig"));
+    std.testing.refAllDecls(@import("plugins/hooks/todo_tracker.zig"));
     std.testing.refAllDecls(@import("tui/app.zig"));
 }
 
@@ -70,8 +75,8 @@ fn parseCli(args: std.process.Args) !Cli {
             const v = it.next() orelse return error.MissingStyleValue;
             if (std.mem.eql(u8, v, "react")) {
                 cli.style = .react;
-            } else if (std.mem.eql(u8, v, "plan-execute")) {
-                cli.style = .plan_execute;
+            } else if (std.mem.eql(u8, v, "todo")) {
+                cli.style = .todo;
             } else {
                 return error.InvalidStyleValue;
             }
@@ -90,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
         const stderr = std.Io.File.stderr();
         var buf: [256]u8 = undefined;
         var w = stderr.writerStreaming(io, &buf);
-        try w.interface.writeAll("Usage: mymew [-p <prompt>] [-s <session-id>] [-m react|plan-execute]\n");
+        try w.interface.writeAll("Usage: mymew [-p <prompt>] [-s <session-id>] [-m react|todo]\n");
         try w.interface.flush();
         return;
     };
@@ -194,13 +199,19 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
     var ui = try tui_mod.Tui.init(gpa, stdout_fd, opts.theme);
     defer ui.deinit();
     ui.setContext(opts.model_label, opts.session_label);
-    ui.plan_execute = style == .plan_execute;
+    ui.todo_mode = style == .todo;
 
     // Seed prompt history from hydrated memory, so ↑ recalls prompts from
-    // previous sessions of this transcript too.
+    // previous sessions of this transcript too. Also restore the todo panel
+    // from the last persisted `todo_write` result, if any — the list was
+    // never stored anywhere but this ordinary tool-result message, so
+    // restoring the panel is just reading it back out (design doc §3.8).
+    var last_todos: ?[]const u8 = null;
     for (mem.items()) |m| {
         if (m.role == .user) ui.pushHistory(m.content);
+        if (m.role == .tool and std.mem.eql(u8, m.name, "todo_write")) last_todos = m.content;
     }
+    if (last_todos) |t| ui.setTodos(t);
 
     ui.enter();
     defer ui.leave();
@@ -277,11 +288,11 @@ fn runInteractive(gpa: std.mem.Allocator, io: std.Io, glm: *llm.Glm, mem: *memor
             }
 
             switch (key) {
-                16 => { // Ctrl+P: toggle orchestration style
+                16 => { // Ctrl+P: toggle todo-nudge style
                     const cur = agent.eng.style.load(.acquire);
-                    const next: engine.Style = if (cur == .react) .plan_execute else .react;
+                    const next: engine.Style = if (cur == .react) .todo else .react;
                     agent.eng.setStyle(next);
-                    ui.setStyle(next == .plan_execute);
+                    ui.setStyle(next == .todo);
                 },
                 7 => ui.toggleHelp(), // Ctrl+G
                 12 => ui.redraw(), // Ctrl+L

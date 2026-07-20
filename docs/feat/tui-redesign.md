@@ -23,7 +23,7 @@ Ranked by severity. ✅ = already right, keep.
 |---|---------|----------|
 | 1 | **Unicode is broken end-to-end.** `wrapLogicalLine` counts *bytes* as columns (`col += 1` per non-escape byte), so any multi-byte UTF-8 in the LLM's output (CJK, emoji, `’`, box chars) wraps early and can split mid-codepoint. `handleKey` drops every byte ≥ 127, so the user cannot *type* non-ASCII at all. | correctness |
 | 2 | **Composer overflow corrupts the screen.** `drawInputLine` writes `"> " + input` at the last row with no clipping; once input exceeds the terminal width, DECAWM autowrap on the bottom row scrolls the whole alternate screen up one line — status line and transcript shift and never recover. | correctness |
-| 3 | **No mid-turn cancel.** `Agent.requestStop()` sets `should_exit`, which the background loop only checks *between* turns. A runaway plan-execute turn (N steps × M tool calls) cannot be interrupted except by killing the app. | UX, needs a small `core/` change |
+| 3 | **No mid-turn cancel.** `Agent.requestStop()` sets `should_exit`, which the background loop only checks *between* turns. A runaway turn (many chained tool calls) cannot be interrupted except by killing the app. | UX, needs a small `core/` change |
 | 4 | **Panic leaves the terminal broken.** Zig panics do not run `defer`s, so a panic exits with raw mode + alt screen still active — the classic worst-case TUI failure. Needs a root-level panic override that restores termios and leaves the alt screen before the default handler prints. | hygiene |
 | 5 | **Zero discoverability.** No footer hints, no help screen. Ctrl+P (style toggle), PgUp/PgDn, and Ctrl+C are all invisible — a new user has to read `main.zig` to learn the keymap. | UX |
 | 6 | **Composer is a byte bucket.** No cursor movement (append/backspace only), no multi-line input (design doc §5.1 promises Shift+Enter newlines), no prompt history. | UX |
@@ -122,8 +122,7 @@ History: composer submissions are already persisted (`.jsonl` memory hydrates ev
 ## 4. Cancel (the one `core/` change)
 
 `Engine` gains `cancel_requested: std.atomic.Value(bool)`. `runToolLoop` checks it at the top
-of each iteration (before each provider call) and between tool dispatches; `stepPlanExecute`
-additionally checks it between steps. On cancel: append a system note `"[turn cancelled by
+of each iteration (before each provider call) and between tool dispatches. On cancel: append a system note `"[turn cancelled by
 user]"` to memory (same persistence rules as everything else), return a new `Outcome.cancelled`,
 and the TUI prints a dim `[cancelled]` line. The provider HTTP call itself is not aborted
 mid-stream in v1 — cancellation takes effect at the next loop boundary, which is honest enough

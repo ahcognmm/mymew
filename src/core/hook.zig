@@ -1,5 +1,22 @@
 const std = @import("std");
 
+/// Runtime-selectable orchestration mode (CLI flag `-m react|todo`, or the
+/// TUI's Ctrl+P toggle). Defined here rather than in `engine.zig` — this
+/// module has no dependency on anything but `std`, so a hook can read
+/// `Ctx.style` without `engine.zig` needing to hand it anything special;
+/// `engine.zig` re-exports this type as `engine.Style` so existing
+/// references to it elsewhere are unaffected. `enum(u8)`, not a bare
+/// `enum`: `engine.zig`'s `style` field is `std.atomic.Value(Style)`, and
+/// `std.atomic.Value(T)` is an `extern struct { raw: T }`, which rejects an
+/// inferred-tag enum at compile time.
+///
+/// Nothing in the orchestrator branches on this — there is only one loop
+/// (ReAct). Its sole effect today is `Ctx.style` below, which
+/// `plugins/hooks/todo_tracker.zig`'s `preLlm` reads to decide whether to
+/// nudge the model toward creating a todo list (design doc §3.5/§3.8): a
+/// hook-visible mode flag, not an orchestrator selector.
+pub const Style = enum(u8) { react, todo };
+
 /// The Comptime Interface Contract for interceptor hook plugins — the
 /// second plugin category alongside tools (design doc §3.7 / §9, and
 /// docs/feat/hooks.MD). Unlike `tool.zig`, where the whole contract
@@ -49,6 +66,12 @@ pub const Ctx = struct {
     /// Hook output written here appears alongside the engine's own
     /// progress markers.
     writer: ?*std.Io.Writer,
+    /// The turn's current orchestration mode (see `Style` above), so a
+    /// hook can vary its behavior without the engine needing a dedicated
+    /// hook point per mode. Defaults to `.react` so the 4 existing `Ctx{...}`
+    /// literal call sites (as of this field's introduction) keep compiling
+    /// unchanged.
+    style: Style = .react,
 };
 
 /// What `preTool` tells the engine to do with a pending tool call.
