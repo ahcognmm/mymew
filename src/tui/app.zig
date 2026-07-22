@@ -1091,11 +1091,12 @@ pub const Tui = struct {
     /// wrapped-row boundary loses its color on the far side, and a span
     /// still open at row end is force-closed with `fg_reset` so it can
     /// never bleed into whatever renders next. Callers pass `false` for
-    /// `.thinking`/`.err` rows — those spans carry their *own* wire-level
-    /// color that persists across many rows via terminal state (no
-    /// re-emission per row), and `fg_reset` closing an inline-code span
-    /// would permanently strip that color for the rest of the span, not
-    /// just the backtick run.
+    /// `.thinking`/`.err` rows — `renderMessages` re-emits those spans'
+    /// start SGR before the text on every row (a wrapped span's marker
+    /// lives only in its first row's bytes), so the backtick highlighter's
+    /// `fg_reset` would strip that color mid-row for the rest of the span,
+    /// not just the backtick run. The span's own closing `\x1b[0m` (in its
+    /// last row) still ends it; no reset is emitted after these rows.
     fn writeRowFiltered(self: *Tui, text: []const u8, highlight_inline: bool) void {
         if (!self.theme.colors) {
             var start: usize = 0;
@@ -1181,12 +1182,24 @@ pub const Tui = struct {
                         self.rawWrite("\u{2502}");
                         self.rawWrite(self.theme.reset);
                         self.rawWrite(" ");
+                        // Re-establish the span color on *every* row. A
+                        // wrapped thinking span's `\x1b[2;3;36m` marker
+                        // lives only in its FIRST row's bytes, so without
+                        // this the `reset` just above leaves continuation
+                        // rows in the terminal default — the bug where only
+                        // the first thinking line was colored. The SGR is
+                        // idempotent (row 0's text also begins with it, so
+                        // emitting twice is harmless); NO_COLOR skips it.
+                        if (self.theme.colors) self.rawWrite(thinking_start_sgr);
                     },
                     .err => {
                         self.rawWrite(self.theme.err_c);
                         self.rawWrite("\u{2502}");
                         self.rawWrite(self.theme.reset);
                         self.rawWrite(" ");
+                        // Same per-row re-establish as `.thinking` above:
+                        // an error span's marker is only in its first row.
+                        if (self.theme.colors) self.rawWrite(error_start_sgr);
                     },
                     .code => {
                         self.rawWrite(self.theme.code_bar);
@@ -2179,4 +2192,43 @@ test "NO_COLOR: rendered output contains no SGR sequences" {
         i = j;
     }
     try testing.expect(std.mem.indexOf(u8, frame.items, "thinking text") != null);
+}
+
+test "thinking span: a wrapped span colors every row, not just the first" {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | o_nonblock);
+
+    var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(true));
+    defer {
+        ui.deinit();
+        _ = std.c.close(pipe_fds[1]);
+    }
+    // Pipe → pinned 80×24; a thinking row reserves 2 gutter cols, so its
+    // text wraps at column 78.
+    try testing.expectEqual(@as(u16, 80), ui.cols);
+
+    // 78 'a's fill row 0 exactly; the sentinel begins row 1. The span's
+    // start marker is at the start of the logical line, so in `transcript`
+    // the sentinel is NOT preceded by any SGR — only the per-row re-emit
+    // in renderMessages can put `thinking_start_sgr` right before it.
+    const payload = thinking_start_sgr ++ ("a" ** 78) ++ "SENTINEL" ++ ("a" ** 20) ++ span_end_sgr ++ "\n";
+    ui.appendOutput(payload);
+
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(testing.allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(pipe_fds[0], &buf, buf.len);
+        if (n <= 0) break;
+        try frame.appendSlice(testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    // The continuation row's sentinel must be preceded by the re-emitted
+    // span color — without the fix it renders in the terminal default.
+    try testing.expect(std.mem.indexOf(u8, frame.items, thinking_start_sgr ++ "SENTINEL") != null);
+    // And row 0 (which carries the marker in its own bytes) still renders.
+    try testing.expect(std.mem.indexOf(u8, frame.items, thinking_start_sgr ++ ("a" ** 78)) != null);
 }
