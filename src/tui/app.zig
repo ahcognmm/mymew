@@ -97,6 +97,9 @@ pub const Theme = struct {
     code_bg: []const u8, // 256-color dark-gray tint painted behind fenced code rows
     inline_code: []const u8, // bold accent used for `inline code` spans within a row
     fg_reset: []const u8, // drops foreground to terminal default without touching an active bg
+    bold_off: []const u8, // "not bold" (SGR 22) — closes a `**bold**` span without a full reset
+    italic: []const u8, // SGR 3 — opens a `*italic*` span
+    italic_off: []const u8, // "not italic" (SGR 23) — closes a `*italic*` span without a full reset
 
     pub fn init(colors: bool) Theme {
         if (!colors) return .{
@@ -112,6 +115,9 @@ pub const Theme = struct {
             .code_bg = "",
             .inline_code = "",
             .fg_reset = "",
+            .bold_off = "",
+            .italic = "",
+            .italic_off = "",
         };
         return .{
             .colors = true,
@@ -126,6 +132,9 @@ pub const Theme = struct {
             .code_bg = "\x1b[48;5;236m",
             .inline_code = "\x1b[1;36m",
             .fg_reset = "\x1b[39m",
+            .bold_off = "\x1b[22m",
+            .italic = "\x1b[3m",
+            .italic_off = "\x1b[23m",
         };
     }
 };
@@ -252,7 +261,11 @@ pub const Gutter = enum { none, thinking, err, code };
 /// A single wrapped physical row: a byte span into `Tui.transcript`. Stored
 /// as offsets rather than slices because `transcript` is an ArrayList that
 /// can reallocate on append — slices taken before a realloc would dangle.
-const Row = struct { start: usize, len: usize, gutter: Gutter = .none };
+/// `line_start` is true only for the first wrapped row of a logical
+/// ('\n'-delimited) line — block-level markdown (`# heading`, `- item`) is
+/// only valid there, never on a row that's really a mid-paragraph wrap
+/// continuation, so `writeRowFiltered` gates that detection on this flag.
+const Row = struct { start: usize, len: usize, gutter: Gutter = .none, line_start: bool = false };
 
 /// Gutter prefix occupies this many visible columns; `wrapLogicalLine`
 /// reserves them when wrapping guttered rows.
@@ -776,7 +789,7 @@ pub const Tui = struct {
 
         const base_width: usize = if (self.cols > 0) self.cols else 80;
         if (line.len == 0) {
-            self.rows_cache.append(self.gpa, .{ .start = abs_start, .len = 0, .gutter = line_gutter orelse self.currentGutter() }) catch {};
+            self.rows_cache.append(self.gpa, .{ .start = abs_start, .len = 0, .gutter = line_gutter orelse self.currentGutter(), .line_start = true }) catch {};
             return;
         }
         var seg_start: usize = 0;
@@ -824,7 +837,7 @@ pub const Tui = struct {
             const d = decodeCp(line[i..]);
             const cw: usize = charWidth(d.cp);
             if (col + cw > width and col > 0) {
-                self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = i - seg_start, .gutter = seg_gutter }) catch {};
+                self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = i - seg_start, .gutter = seg_gutter, .line_start = seg_start == 0 }) catch {};
                 seg_start = i;
                 col = 0;
                 seg_gutter = line_gutter orelse self.currentGutter();
@@ -834,7 +847,7 @@ pub const Tui = struct {
             i += d.len;
         }
         if (seg_start < line.len or seg_start == 0) {
-            self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = line.len - seg_start, .gutter = seg_gutter }) catch {};
+            self.rows_cache.append(self.gpa, .{ .start = abs_start + seg_start, .len = line.len - seg_start, .gutter = seg_gutter, .line_start = seg_start == 0 }) catch {};
         }
     }
 
@@ -1086,18 +1099,82 @@ pub const Tui = struct {
     /// escape sequences are stripped so NO_COLOR output is genuinely plain.
     /// With colors enabled, any embedded SGR (wire markers, tool-marker
     /// inline styling) passes through untouched; when `highlight_inline` is
-    /// set, `` `backtick` `` spans additionally get colored as inline code.
-    /// Highlighting is render-time and row-local: a span split across a
-    /// wrapped-row boundary loses its color on the far side, and a span
-    /// still open at row end is force-closed with `fg_reset` so it can
-    /// never bleed into whatever renders next. Callers pass `false` for
+    /// set, `` `backtick` `` spans additionally get colored (markers kept,
+    /// just recolored) and `**bold**`/`*italic*` spans get styled with
+    /// their marker bytes dropped from output (raw asterisks next to
+    /// unstyled text read as noise, not formatting, so unlike backticks
+    /// they're consumed rather than kept-and-colored). When `line_start` is
+    /// also set (true only on a logical line's first wrapped row — see
+    /// `Row.line_start`), a leading `# heading` is bolded with its `#`s
+    /// stripped, and a leading `- `/`*`/`+ ` bullet is swapped for a
+    /// colored `•` or a leading `1. ` ordinal is recolored in place; these
+    /// are block-level, so unlike the inline spans above they only apply to
+    /// this one row (a heading/list item long enough to wrap loses styling
+    /// on its continuation rows). Highlighting is
+    /// render-time and row-local: a span split across a wrapped-row
+    /// boundary loses its styling on the far side, and any span still open
+    /// at row end is force-closed (code via `fg_reset`, bold/italic via
+    /// their SGR "off" codes) so it can never bleed into whatever renders
+    /// next. Callers pass `false` for
     /// `.thinking`/`.err` rows — `renderMessages` re-emits those spans'
     /// start SGR before the text on every row (a wrapped span's marker
     /// lives only in its first row's bytes), so the backtick highlighter's
     /// `fg_reset` would strip that color mid-row for the rest of the span,
     /// not just the backtick run. The span's own closing `\x1b[0m` (in its
     /// last row) still ends it; no reset is emitted after these rows.
-    fn writeRowFiltered(self: *Tui, text: []const u8, highlight_inline: bool) void {
+    /// CommonMark's "left-flanking" rule, simplified: an emphasis marker
+    /// only opens a span if the character right after it isn't whitespace —
+    /// this is what stops a markdown bullet ("* item") or a stray
+    /// multiplication ("2 * 3") from being misread as an opening delimiter.
+    fn mdOpensHere(text: []const u8, after: usize) bool {
+        return after < text.len and text[after] != ' ' and text[after] != '\t';
+    }
+
+    /// True if `run` (a literal marker, e.g. "**") occurs again anywhere at
+    /// or after `from`. Used to confirm a matching close exists before
+    /// committing to open a span — an unmatched marker is then left as
+    /// plain text instead of coloring to the end of the row.
+    fn mdHasLaterRun(text: []const u8, from: usize, run: []const u8) bool {
+        if (from > text.len or run.len > text.len - from) return false;
+        return std.mem.indexOfPos(u8, text, from, run) != null;
+    }
+
+    /// ATX heading prefix per CommonMark: 1-6 `#` followed by a space, or by
+    /// end of line (a bare "#"). More than 6 leading `#`s, or a `#` run with
+    /// no following space/EOL, isn't a heading — returns null so the row
+    /// falls through to plain-text handling. On a match, returns the byte
+    /// count to strip (hashes + the one separating space, if present).
+    fn mdHeaderPrefixLen(text: []const u8) ?usize {
+        var n: usize = 0;
+        while (n < text.len and n < 6 and text[n] == '#') : (n += 1) {}
+        if (n == 0) return null;
+        if (n < text.len and text[n] == ' ') return n + 1;
+        if (n == text.len) return n;
+        return null;
+    }
+
+    /// Unordered list marker at true line start: `-`, `*`, or `+` followed
+    /// by exactly one space. Returns the 2-byte prefix length to strip.
+    fn mdBulletPrefixLen(text: []const u8) ?usize {
+        if (text.len < 2) return null;
+        if ((text[0] == '-' or text[0] == '*' or text[0] == '+') and text[1] == ' ') return 2;
+        return null;
+    }
+
+    /// Ordered list marker at true line start: 1-9 ASCII digits, then `.`
+    /// or `)`, then a space — e.g. "1. " or "12) ". Returns the prefix
+    /// length (kept and recolored, not stripped, since the ordinal itself
+    /// is meaningful content, unlike a bullet's `-`/`*`/`+`).
+    fn mdOrderedPrefixLen(text: []const u8) ?usize {
+        var n: usize = 0;
+        while (n < text.len and n < 9 and text[n] >= '0' and text[n] <= '9') : (n += 1) {}
+        if (n == 0 or n >= text.len) return null;
+        if (text[n] != '.' and text[n] != ')') return null;
+        if (n + 1 >= text.len or text[n + 1] != ' ') return null;
+        return n + 2;
+    }
+
+    fn writeRowFiltered(self: *Tui, text: []const u8, highlight_inline: bool, line_start: bool) void {
         if (!self.theme.colors) {
             var start: usize = 0;
             var i: usize = 0;
@@ -1123,8 +1200,37 @@ pub const Tui = struct {
             return;
         }
 
-        var in_span = false;
+        var in_code = false;
+        var in_bold = false;
+        var in_italic = false;
         var i: usize = 0;
+        // Block-level markdown (heading, list marker) only applies at the
+        // true start of a logical line — `line_start` is already false for
+        // any row that's really a wrap continuation, so no separate check
+        // is needed here. A heading's bold span (`header_open`) stays open
+        // across the rest of the row, including through any inline
+        // `**bold**`/`*italic*` inside the heading text — if one of those
+        // closes with its own "off" code, it also cancels the heading's
+        // bold; accepted as a rare-in-practice edge case rather than
+        // tracking a full attribute stack for one row type.
+        var header_open = false;
+        if (line_start) {
+            if (mdHeaderPrefixLen(text)) |plen| {
+                self.rawWrite(self.theme.bold);
+                header_open = true;
+                i = plen;
+            } else if (mdBulletPrefixLen(text)) |plen| {
+                self.rawWrite(self.theme.accent);
+                self.rawWrite("\u{2022} ");
+                self.rawWrite(self.theme.fg_reset);
+                i = plen;
+            } else if (mdOrderedPrefixLen(text)) |plen| {
+                self.rawWrite(self.theme.accent);
+                self.rawWrite(text[0..plen]);
+                self.rawWrite(self.theme.fg_reset);
+                i = plen;
+            }
+        }
         while (i < text.len) {
             if (text[i] == 0x1b) {
                 const esc_start = i;
@@ -1138,17 +1244,62 @@ pub const Tui = struct {
                 continue;
             }
             if (text[i] == '`') {
-                self.rawWrite(if (in_span) self.theme.fg_reset else self.theme.inline_code);
-                in_span = !in_span;
+                self.rawWrite(if (in_code) self.theme.fg_reset else self.theme.inline_code);
+                in_code = !in_code;
                 self.rawWrite("`");
                 i += 1;
                 continue;
+            }
+            // `**bold**` / `*italic*`: unlike the backtick treatment above,
+            // markers are dropped rather than kept-and-colored — a
+            // weight/slant-only change next to an unaltered `**`/`*` reads
+            // as noise, not formatting, in terminal fonts without a
+            // strongly distinct bold/italic face. Dropping the marker bytes
+            // means `wrapLogicalLine`'s column budget (computed on raw
+            // bytes before this filtering runs) slightly overestimates a
+            // formatted row's width — the safe direction, same tradeoff
+            // already accepted for ZWJ emoji overcounting: rows wrap a few
+            // columns early rather than ever overflowing. Bold is checked
+            // before italic since it's the longer marker; an unmatched
+            // marker (no later partner on this row) or one immediately
+            // followed by whitespace is left as a plain, visible character.
+            if (!in_code and text[i] == '*') {
+                if (i + 1 < text.len and text[i + 1] == '*') {
+                    if (in_bold) {
+                        self.rawWrite(self.theme.bold_off);
+                        in_bold = false;
+                        i += 2;
+                        continue;
+                    }
+                    if (mdOpensHere(text, i + 2) and mdHasLaterRun(text, i + 2, "**")) {
+                        self.rawWrite(self.theme.bold);
+                        in_bold = true;
+                        i += 2;
+                        continue;
+                    }
+                } else {
+                    if (in_italic) {
+                        self.rawWrite(self.theme.italic_off);
+                        in_italic = false;
+                        i += 1;
+                        continue;
+                    }
+                    if (mdOpensHere(text, i + 1) and mdHasLaterRun(text, i + 1, "*")) {
+                        self.rawWrite(self.theme.italic);
+                        in_italic = true;
+                        i += 1;
+                        continue;
+                    }
+                }
             }
             const d = decodeCp(text[i..]);
             self.rawWrite(text[i .. i + d.len]);
             i += d.len;
         }
-        if (in_span) self.rawWrite(self.theme.fg_reset);
+        if (in_code) self.rawWrite(self.theme.fg_reset);
+        if (in_bold) self.rawWrite(self.theme.bold_off);
+        if (in_italic) self.rawWrite(self.theme.italic_off);
+        if (header_open) self.rawWrite(self.theme.bold_off);
     }
 
     /// Redraws the message viewport from `rows_cache`, honoring
@@ -1210,7 +1361,7 @@ pub const Tui = struct {
                         self.rawWrite(" ");
                     },
                 }
-                self.writeRowFiltered(self.rowText(r), r.gutter == .none or r.gutter == .code);
+                self.writeRowFiltered(self.rowText(r), r.gutter == .none or r.gutter == .code, r.line_start and r.gutter == .none);
                 // Detection here is render-time (fence bytes, not a wire
                 // marker), so unlike thinking/err spans nothing in the row
                 // text itself carries a closing reset — do it explicitly.
@@ -2015,6 +2166,136 @@ test "inline code: a backtick span is colored and does not bleed past its closin
 
     ui.appendOutput("run `zig build test` now\n");
     try testing.expect(std.mem.indexOf(u8, ui.transcript.items, "`zig build test`") != null);
+}
+
+test "markdown: **bold** and *italic* spans render styled with marker bytes dropped" {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | o_nonblock);
+
+    var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(true));
+    defer {
+        ui.deinit();
+        _ = std.c.close(pipe_fds[1]);
+    }
+
+    ui.appendOutput("a **bold** and *italic* word\n");
+
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(testing.allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(pipe_fds[0], &buf, buf.len);
+        if (n <= 0) break;
+        try frame.appendSlice(testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    // Marker bytes are consumed, not kept-and-colored: the SGR brackets
+    // the plain word directly, with no literal "*" surviving into output.
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\x1b[1mbold\x1b[22m") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\x1b[3mitalic\x1b[23m") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "*") == null);
+}
+
+test "markdown: a lone '2 * 3' and an unmatched mid-line '*' are not misread as italic" {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | o_nonblock);
+
+    var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(true));
+    defer {
+        ui.deinit();
+        _ = std.c.close(pipe_fds[1]);
+    }
+
+    // "2 * 3 = 6" has no unmatched, non-whitespace-flanked partner at all;
+    // "an unmatched * here" has a `*` with no later partner on the row.
+    // Neither should ever emit the italic "on" SGR.
+    ui.appendOutput("2 * 3 = 6\nan unmatched * here\n");
+
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(testing.allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(pipe_fds[0], &buf, buf.len);
+        if (n <= 0) break;
+        try frame.appendSlice(testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try testing.expect(std.mem.indexOf(u8, frame.items, "2 * 3 = 6") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "an unmatched * here") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\x1b[3m") == null);
+}
+
+test "markdown: a heading has its '#'s stripped and the rest bolded" {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | o_nonblock);
+
+    var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(true));
+    defer {
+        ui.deinit();
+        _ = std.c.close(pipe_fds[1]);
+    }
+
+    ui.appendOutput("# Title\n## Sub\nplain # not a heading\n");
+
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(testing.allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(pipe_fds[0], &buf, buf.len);
+        if (n <= 0) break;
+        try frame.appendSlice(testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\x1b[1mTitle") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\x1b[1mSub") != null);
+    // A '#' that isn't at true line start (mid-paragraph) is left alone —
+    // no heading styling, no stripping.
+    try testing.expect(std.mem.indexOf(u8, frame.items, "plain # not a heading") != null);
+}
+
+test "markdown: unordered bullets become a colored dot, ordered markers stay and recolor" {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    const fl = std.c.fcntl(pipe_fds[0], posix.F.GETFL, @as(c_int, 0));
+    _ = std.c.fcntl(pipe_fds[0], posix.F.SETFL, fl | o_nonblock);
+
+    var ui = try Tui.init(testing.allocator, pipe_fds[1], Theme.init(true));
+    defer {
+        ui.deinit();
+        _ = std.c.close(pipe_fds[1]);
+    }
+
+    ui.appendOutput("- first\n* second\n1. third\n");
+
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(testing.allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(pipe_fds[0], &buf, buf.len);
+        if (n <= 0) break;
+        try frame.appendSlice(testing.allocator, buf[0..@intCast(n)]);
+    }
+
+    // Both "-" and "*" bullets are normalized to the same colored glyph
+    // (an SGR reset sits between the glyph and the item text); the literal
+    // marker characters don't survive into output.
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\u{2022} \x1b[39mfirst") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "\u{2022} \x1b[39msecond") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "- first") == null);
+    try testing.expect(std.mem.indexOf(u8, frame.items, "* second") == null);
+    // Ordered markers keep their number (it's meaningful), just recolored
+    // (again with the "off" SGR between the marker and the item text).
+    try testing.expect(std.mem.indexOf(u8, frame.items, "1. \x1b[39mthird") != null);
 }
 
 test "processStream: bracketed content flows through to the transcript untouched" {
